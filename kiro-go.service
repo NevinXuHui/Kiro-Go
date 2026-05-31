@@ -1,0 +1,20 @@
+[Unit]
+Description=Kiro-Go API Service
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/mine/Code/ai-tools/Kiro-Go
+ExecStart=/mine/Code/ai-tools/Kiro-Go/kiro-go
+Restart=always
+RestartSec=5
+Environment="CONFIG_PATH=/mine/Code/ai-tools/Kiro-Go/data/config.json"
+
+# 日志
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=kiro-go
+
+[Install]
+WantedBy=multi-user.target
