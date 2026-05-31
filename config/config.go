@@ -174,6 +174,10 @@ type Config struct {
 	// solely because usageCurrent >= usageLimit.
 	AllowOverUsage bool `json:"allowOverUsage,omitempty"`
 
+	// ShowExhaustedAccounts controls whether to display accounts with exhausted quota
+	// in the admin panel account list. Defaults to true.
+	ShowExhaustedAccounts *bool `json:"showExhaustedAccounts,omitempty"`
+
 	// Proxy configuration: optional outbound proxy for Kiro API requests
 	// Format: "socks5://host:port", "socks5://user:pass@host:port",
 	//         "http://host:port",  "http://user:pass@host:port"
@@ -834,6 +838,24 @@ func UpdateAllowOverUsage(allow bool) error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
 	cfg.AllowOverUsage = allow
+	return Save()
+}
+
+// GetShowExhaustedAccounts returns whether to show exhausted accounts in the admin panel.
+func GetShowExhaustedAccounts() bool {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	if cfg == nil || cfg.ShowExhaustedAccounts == nil {
+		return true // default to showing
+	}
+	return *cfg.ShowExhaustedAccounts
+}
+
+// UpdateShowExhaustedAccounts sets whether to show exhausted accounts and persists the change.
+func UpdateShowExhaustedAccounts(show bool) error {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	cfg.ShowExhaustedAccounts = &show
 	return Save()
 }
 

@@ -19,6 +19,7 @@
   let filterStatus = 'all';
   let currentPage = 1;
   let pageSize = 20;
+  let showExhaustedAccounts = true;
   let privacyModeEnabled = true;
   let promptRules = [];
   let builderIdSession = '';
@@ -662,20 +663,57 @@
     $('statSuccess').textContent = d.successRequests || 0;
     $('statFailed').textContent = d.failedRequests || 0;
     $('statTokens').textContent = formatNum(d.totalTokens || 0);
-    $('statCredits').textContent = (d.totalCredits || 0).toFixed(1);
   }
   async function loadAccounts() {
     const res = await api('/accounts');
     accountsData = await res.json();
+    updateAccountStats();
     renderAccounts();
+  }
+
+  function updateAccountStats() {
+    let normal = 0, disabled = 0, exhausted = 0, banned = 0;
+
+    accountsData.forEach(a => {
+      const isBanned = a.banStatus && a.banStatus !== 'ACTIVE';
+      const isQuotaExhausted = a.usageLimit > 0 && a.usageCurrent >= a.usageLimit;
+
+      if (isBanned) {
+        banned++;
+      } else if (isQuotaExhausted) {
+        exhausted++;
+      } else if (!a.enabled) {
+        disabled++;
+      } else {
+        normal++;
+      }
+    });
+
+    $('statNormal').textContent = normal;
+    $('statDisabled').textContent = disabled;
+    $('statExhausted').textContent = exhausted;
+    $('statBanned').textContent = banned;
   }
 
   // Account list
   function getFilteredAccounts() {
     return accountsData.filter(a => {
+      // 过滤已用完的账号（如果设置中关闭了显示）
+      if (!showExhaustedAccounts) {
+        const isQuotaExhausted = a.usageLimit > 0 && a.usageCurrent >= a.usageLimit;
+        if (isQuotaExhausted) return false;
+      }
+
+      // 状态筛选
       if (filterStatus === 'enabled' && !a.enabled) return false;
       if (filterStatus === 'disabled' && (a.enabled || (a.banStatus && a.banStatus !== 'ACTIVE'))) return false;
+      if (filterStatus === 'exhausted') {
+        const isQuotaExhausted = a.usageLimit > 0 && a.usageCurrent >= a.usageLimit;
+        if (!isQuotaExhausted) return false;
+      }
       if (filterStatus === 'banned' && (!a.banStatus || a.banStatus === 'ACTIVE')) return false;
+
+      // 关键词搜索
       if (filterKeyword) {
         const kw = filterKeyword.toLowerCase();
         if (!(a.email || '').toLowerCase().includes(kw)) return false;
@@ -762,10 +800,31 @@
   function getStatusBadge(a) {
     const out = [];
     const isBanned = a.banStatus && a.banStatus !== 'ACTIVE';
+    const isQuotaExhausted = a.usageLimit > 0 && a.usageCurrent >= a.usageLimit;
+
     if (isBanned) {
-      if (a.banStatus === 'BANNED') out.push('<span class="badge badge-banned">' + escapeHtml(t('accounts.banned')) + '</span>');
-      else if (a.banStatus === 'SUSPENDED') out.push('<span class="badge badge-suspended">' + escapeHtml(t('accounts.suspended')) + '</span>');
+      let banText = '';
+      if (a.banStatus === 'BANNED') {
+        banText = t('accounts.banned');
+      } else if (a.banStatus === 'SUSPENDED') {
+        banText = t('accounts.suspended');
+      }
+
+      // 添加封禁时间
+      if (a.banTime) {
+        const banDate = new Date(a.banTime * 1000);
+        const timeStr = formatBanTime(banDate);
+        banText += ' (' + timeStr + ')';
+      }
+
+      if (a.banStatus === 'BANNED') {
+        out.push('<span class="badge badge-banned">' + escapeHtml(banText) + '</span>');
+      } else if (a.banStatus === 'SUSPENDED') {
+        out.push('<span class="badge badge-suspended">' + escapeHtml(banText) + '</span>');
+      }
       out.push('<span class="badge badge-warning">' + escapeHtml(t('accounts.disabled')) + '</span>');
+    } else if (isQuotaExhausted) {
+      out.push('<span class="badge badge-error">' + escapeHtml(t('accounts.quotaExhausted')) + '</span>');
     } else {
       if (!a.hasToken)
         out.push('<span class="badge badge-error">' + escapeHtml(t('accounts.noToken')) + '</span>');
@@ -778,6 +837,24 @@
         : '<span class="badge badge-warning">' + escapeHtml(t('accounts.disabled')) + '</span>');
     }
     return out.join('');
+  }
+
+  function formatBanTime(date) {
+    const now = new Date();
+    const diff = now - date;
+    const days = Math.floor(diff / (1000 * 60 * 60 * 24));
+    const hours = Math.floor(diff / (1000 * 60 * 60));
+    const minutes = Math.floor(diff / (1000 * 60));
+
+    if (days > 0) {
+      return days + t('time.daysAgo');
+    } else if (hours > 0) {
+      return hours + t('time.hoursAgo');
+    } else if (minutes > 0) {
+      return minutes + t('time.minutesAgo');
+    } else {
+      return t('time.justNow');
+    }
   }
   function formatTokenExpiry(ts) {
     if (!ts) return '-';
@@ -828,6 +905,7 @@
       const weightBadge = weight >= 2 ? '<span class="badge badge-warning">' + escapeHtml(t('accounts.weightShort')) + ':' + weight + '</span>' : '';
       const overageBadge = renderOverageBadge(a);
       const banned = a.banStatus && a.banStatus !== 'ACTIVE';
+      const isQuotaExhausted = a.usageLimit > 0 && a.usageCurrent >= a.usageLimit;
       const idAttr = escapeAttr(a.id);
       const displayEmail = getDisplayEmail(a.email, a.id);
       const selectLabel = t('accounts.selectAccount', displayEmail);
@@ -857,7 +935,7 @@
         '<button class="btn btn-icon btn-sm btn-ghost" data-action="refresh" data-id="' + idAttr + '" title="' + escapeAttr(t('accounts.refresh')) + '">' + refreshSvg + '</button>' +
         '<button class="btn btn-icon btn-sm btn-ghost" data-action="detail" data-id="' + idAttr + '" title="' + escapeAttr(t('accounts.detail')) + '">' + userSvg + '</button>' +
         '<button class="btn btn-icon btn-sm btn-ghost" data-action="copyJSON" data-id="' + idAttr + '" title="' + escapeAttr(t('accounts.copyJSON')) + '">' + copySvg + '</button>' +
-        (banned ? '' :
+        (banned || isQuotaExhausted ? '' :
           '<button class="btn btn-sm ' + (a.enabled ? 'btn-outline' : 'btn-primary') + '" data-action="toggle" data-id="' + idAttr + '" data-enabled="' + (!a.enabled) + '">' +
           escapeHtml(a.enabled ? t('accounts.disable') : t('accounts.enable')) +
           '</button>') +
@@ -1507,6 +1585,8 @@
     const d = await res.json();
     $('requireApiKey').checked = d.requireApiKey;
     $('allowOverUsage').checked = d.allowOverUsage || false;
+    $('showExhaustedAccounts').checked = d.showExhaustedAccounts !== false;
+    showExhaustedAccounts = d.showExhaustedAccounts !== false;
     await Promise.all([loadThinkingConfig(), loadEndpointConfig(), loadProxyConfig(), loadPromptFilter(), loadApiKeys()]);
     refreshCustomSelects();
   }
@@ -1612,7 +1692,11 @@
   }
   async function saveOverUsageConfig() {
     const allowOverUsage = $('allowOverUsage').checked;
-    await api('/settings', { method: 'POST', body: JSON.stringify({ allowOverUsage }) });
+    const showExhaustedAccountsValue = $('showExhaustedAccounts').checked;
+    await api('/settings', { method: 'POST', body: JSON.stringify({ allowOverUsage, showExhaustedAccounts: showExhaustedAccountsValue }) });
+    showExhaustedAccounts = showExhaustedAccountsValue;
+    currentPage = 1;
+    renderAccounts();
     toast(t('settings.overUsageSaved'), 'success');
   }
   async function changePassword() {

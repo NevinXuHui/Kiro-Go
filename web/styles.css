@@ -1195,8 +1195,8 @@ img.brand-icon {
 .stat-sub {
   display: flex;
   align-items: center;
-  gap: 0.3125rem;
-  flex-wrap: nowrap;
+  gap: 0.5rem;
+  flex-wrap: wrap;
   min-height: 1rem;
 }
 .stat-sub-sec {
@@ -1211,6 +1211,15 @@ img.brand-icon {
   color: var(--foreground);
   font-feature-settings: "tnum";
   letter-spacing: -0.01em;
+}
+.stat-value-success {
+  color: var(--success);
+}
+.stat-value-muted {
+  color: var(--muted-foreground);
+}
+.stat-value-danger {
+  color: var(--destructive);
 }
 .stat-value--danger {
   color: var(--destructive) !important;

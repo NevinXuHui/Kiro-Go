@@ -138,8 +138,14 @@
             <div class="stat-main">
               <div class="stat-value" id="statAccounts">0</div>
               <div class="stat-sub">
-                <span class="stat-sub-sec"><span class="stat-value-sm" id="statCredits">0</span> <span
-                    class="stat-label" data-i18n="stats.credits"></span></span>
+                <span class="stat-sub-sec"><span class="stat-value-sm stat-value-success" id="statNormal">0</span> <span
+                    class="stat-label" data-i18n="stats.normal"></span></span>
+                <span class="stat-sub-sec"><span class="stat-value-sm stat-value-muted" id="statDisabled">0</span> <span
+                    class="stat-label" data-i18n="stats.disabled"></span></span>
+                <span class="stat-sub-sec"><span class="stat-value-sm stat-value-danger" id="statExhausted">0</span> <span
+                    class="stat-label" data-i18n="stats.exhausted"></span></span>
+                <span class="stat-sub-sec"><span class="stat-value-sm stat-value-danger" id="statBanned">0</span> <span
+                    class="stat-label" data-i18n="stats.banned"></span></span>
               </div>
             </div>
             <i class="fa-solid fa-users stat-icon" aria-hidden="true"></i>
@@ -223,6 +229,7 @@
               <option value="all" data-i18n="filter.all"></option>
               <option value="enabled" data-i18n="filter.enabled"></option>
               <option value="disabled" data-i18n="filter.disabled"></option>
+              <option value="exhausted" data-i18n="filter.exhausted"></option>
               <option value="banned" data-i18n="filter.banned"></option>
             </select>
           </div>
@@ -269,6 +276,13 @@
               <span data-i18n="settings.allowOverUsage"></span>
             </label>
             <small data-i18n="settings.allowOverUsageHint"></small>
+          </div>
+          <div class="form-group">
+            <label class="flex items-center gap-2">
+              <span class="switch"><input type="checkbox" id="showExhaustedAccounts" /><span class="slider"></span></span>
+              <span data-i18n="settings.showExhaustedAccounts"></span>
+            </label>
+            <small data-i18n="settings.showExhaustedAccountsHint"></small>
           </div>
           <button class="btn btn-primary" id="saveOverUsageBtn" data-i18n="settings.saveUsage"></button>
         </div>
