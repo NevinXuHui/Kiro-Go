@@ -1819,6 +1819,12 @@ img.brand-icon {
   margin-top: 0.5rem;
   flex-wrap: wrap;
 }
+#accountsPaginationTop .pagination {
+  border-top: none;
+  border-bottom: 1px solid var(--border);
+  margin-top: 0;
+  margin-bottom: 0.5rem;
+}
 .pagination-info {
   font-size: 0.875rem;
   color: var(--muted-foreground);

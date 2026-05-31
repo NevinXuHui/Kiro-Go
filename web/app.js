@@ -895,16 +895,18 @@
 
   function renderPagination(totalCount) {
     const paginationContainer = $('accountsPagination');
-    if (!paginationContainer) return;
+    const paginationTopContainer = $('accountsPaginationTop');
 
     if (totalCount === 0) {
-      paginationContainer.innerHTML = '';
+      if (paginationContainer) paginationContainer.innerHTML = '';
+      if (paginationTopContainer) paginationTopContainer.innerHTML = '';
       return;
     }
 
     const totalPages = Math.ceil(totalCount / pageSize);
     if (totalPages <= 1) {
-      paginationContainer.innerHTML = '';
+      if (paginationContainer) paginationContainer.innerHTML = '';
+      if (paginationTopContainer) paginationTopContainer.innerHTML = '';
       return;
     }
 
@@ -960,13 +962,14 @@
     html += '</div>';
 
     html += '</div>';
-    paginationContainer.innerHTML = html;
+
+    if (paginationContainer) paginationContainer.innerHTML = html;
+    if (paginationTopContainer) paginationTopContainer.innerHTML = html;
   }
 
   window.goToPage = function(page) {
     currentPage = page;
     renderAccounts();
-    window.scrollTo({ top: 0, behavior: 'smooth' });
   };
 
   window.changePageSize = function(size) {
