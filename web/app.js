@@ -17,6 +17,8 @@
   const selectedAccounts = new Set();
   let filterKeyword = '';
   let filterStatus = 'all';
+  let currentPage = 1;
+  let pageSize = 20;
   let privacyModeEnabled = true;
   let promptRules = [];
   let builderIdSession = '';
@@ -684,6 +686,7 @@
   function onFilterChange() {
     filterKeyword = $('filterSearch').value;
     filterStatus = $('filterStatusSelect').value;
+    currentPage = 1;
     renderAccounts();
   }
   function toggleSelectAll(checked) {
@@ -802,9 +805,20 @@
     const filtered = getFilteredAccounts();
     if (filtered.length === 0) {
       container.innerHTML = '<div class="empty-state">' + escapeHtml(t('accounts.empty')) + '</div>';
+      renderPagination(0);
       return;
     }
-    container.innerHTML = filtered.map(a => {
+
+    // 分页计算
+    const totalPages = Math.ceil(filtered.length / pageSize);
+    if (currentPage > totalPages) currentPage = totalPages;
+    if (currentPage < 1) currentPage = 1;
+
+    const startIdx = (currentPage - 1) * pageSize;
+    const endIdx = Math.min(startIdx + pageSize, filtered.length);
+    const pageAccounts = filtered.slice(startIdx, endIdx);
+
+    container.innerHTML = pageAccounts.map(a => {
       const usagePct = (a.usagePercent || 0) * 100;
       const usageClass = usagePct > 90 ? 'critical' : usagePct > 70 ? 'high' : '';
       const trialPct = (a.trialUsagePercent || 0) * 100;
@@ -876,7 +890,90 @@
     }).join('');
     applyUsageBars(container);
     enhanceCustomSelects(container);
+    renderPagination(filtered.length);
   }
+
+  function renderPagination(totalCount) {
+    const paginationContainer = $('accountsPagination');
+    if (!paginationContainer) return;
+
+    if (totalCount === 0) {
+      paginationContainer.innerHTML = '';
+      return;
+    }
+
+    const totalPages = Math.ceil(totalCount / pageSize);
+    if (totalPages <= 1) {
+      paginationContainer.innerHTML = '';
+      return;
+    }
+
+    const startIdx = (currentPage - 1) * pageSize + 1;
+    const endIdx = Math.min(currentPage * pageSize, totalCount);
+
+    let html = '<div class="pagination">';
+    html += '<div class="pagination-info">' + escapeHtml(t('pagination.showing', startIdx, endIdx, totalCount)) + '</div>';
+    html += '<div class="pagination-controls">';
+
+    // 首页
+    html += '<button class="btn btn-sm btn-outline" ' + (currentPage === 1 ? 'disabled' : '') + ' onclick="goToPage(1)"><i class="fa-solid fa-angles-left"></i></button>';
+
+    // 上一页
+    html += '<button class="btn btn-sm btn-outline" ' + (currentPage === 1 ? 'disabled' : '') + ' onclick="goToPage(' + (currentPage - 1) + ')"><i class="fa-solid fa-angle-left"></i></button>';
+
+    // 页码
+    const maxButtons = 5;
+    let startPage = Math.max(1, currentPage - Math.floor(maxButtons / 2));
+    let endPage = Math.min(totalPages, startPage + maxButtons - 1);
+
+    if (endPage - startPage < maxButtons - 1) {
+      startPage = Math.max(1, endPage - maxButtons + 1);
+    }
+
+    if (startPage > 1) {
+      html += '<span class="pagination-ellipsis">...</span>';
+    }
+
+    for (let i = startPage; i <= endPage; i++) {
+      html += '<button class="btn btn-sm ' + (i === currentPage ? 'btn-primary' : 'btn-outline') + '" onclick="goToPage(' + i + ')">' + i + '</button>';
+    }
+
+    if (endPage < totalPages) {
+      html += '<span class="pagination-ellipsis">...</span>';
+    }
+
+    // 下一页
+    html += '<button class="btn btn-sm btn-outline" ' + (currentPage === totalPages ? 'disabled' : '') + ' onclick="goToPage(' + (currentPage + 1) + ')"><i class="fa-solid fa-angle-right"></i></button>';
+
+    // 末页
+    html += '<button class="btn btn-sm btn-outline" ' + (currentPage === totalPages ? 'disabled' : '') + ' onclick="goToPage(' + totalPages + ')"><i class="fa-solid fa-angles-right"></i></button>';
+
+    html += '</div>';
+
+    // 每页数量选择
+    html += '<div class="pagination-size">';
+    html += '<select class="pagination-size-select" onchange="changePageSize(this.value)">';
+    [10, 20, 50, 100].forEach(size => {
+      html += '<option value="' + size + '" ' + (pageSize === size ? 'selected' : '') + '>' + size + ' / ' + escapeHtml(t('pagination.page')) + '</option>';
+    });
+    html += '</select>';
+    html += '</div>';
+
+    html += '</div>';
+    paginationContainer.innerHTML = html;
+  }
+
+  window.goToPage = function(page) {
+    currentPage = page;
+    renderAccounts();
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+  };
+
+  window.changePageSize = function(size) {
+    pageSize = parseInt(size);
+    currentPage = 1;
+    renderAccounts();
+  };
 
   // Account actions
   async function refreshAccount(id, card) {

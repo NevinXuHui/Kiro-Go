@@ -435,5 +435,7 @@
   "apiKeys.closeBtn": "关闭",
   "apiKeys.saveBtn": "保存",
   "apiKeys.cancelBtn": "取消",
-  "apiKeys.loadFailed": "加载 API Key 列表失败"
+  "apiKeys.loadFailed": "加载 API Key 列表失败",
+  "pagination.showing": "显示 {0}-{1}，共 {2} 条",
+  "pagination.page": "页"
 }

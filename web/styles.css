@@ -1808,6 +1808,64 @@ img.brand-icon {
   font-feature-settings: "tnum";
 }
 
+/* Pagination */
+.pagination {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: 1rem 0.5rem;
+  border-top: 1px solid var(--border);
+  margin-top: 0.5rem;
+  flex-wrap: wrap;
+}
+.pagination-info {
+  font-size: 0.875rem;
+  color: var(--muted-foreground);
+}
+.pagination-controls {
+  display: flex;
+  align-items: center;
+  gap: 0.25rem;
+  flex-wrap: wrap;
+}
+.pagination-ellipsis {
+  padding: 0 0.5rem;
+  color: var(--muted-foreground);
+  font-size: 0.875rem;
+}
+.pagination-size {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+.pagination-size-select {
+  padding: 0.375rem 0.5rem;
+  font-size: 0.875rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--background);
+  color: var(--foreground);
+  cursor: pointer;
+}
+@media (max-width: 640px) {
+  .pagination {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 0.75rem;
+  }
+  .pagination-controls {
+    justify-content: center;
+  }
+  .pagination-info {
+    text-align: center;
+  }
+  .pagination-size {
+    justify-content: center;
+  }
+}
+
+
 /* Modals */
 .modal {
   position: fixed;

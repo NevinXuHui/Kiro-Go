@@ -435,5 +435,7 @@
   "apiKeys.closeBtn": "Close",
   "apiKeys.saveBtn": "Save",
   "apiKeys.cancelBtn": "Cancel",
-  "apiKeys.loadFailed": "Failed to load API keys"
+  "apiKeys.loadFailed": "Failed to load API keys",
+  "pagination.showing": "Showing {0}-{1} of {2}",
+  "pagination.page": "page"
 }
