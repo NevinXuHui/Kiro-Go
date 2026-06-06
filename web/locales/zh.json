@@ -65,6 +65,7 @@
   "accounts.trialDays": "天后到期",
   "accounts.copyJSON": "复制 JSON",
   "accounts.copyJSONSuccess": "JSON 已复制到剪贴板",
+  "accounts.active": "活跃中",
   "accounts.overage": "超额调用",
   "accounts.overageOn": "超额开",
   "accounts.overageOff": "超额关",

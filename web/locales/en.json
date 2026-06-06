@@ -65,6 +65,7 @@
   "accounts.trialDays": "d left",
   "accounts.copyJSON": "Copy JSON",
   "accounts.copyJSONSuccess": "JSON copied to clipboard",
+  "accounts.active": "Active",
   "accounts.overage": "Overage",
   "accounts.overageOn": "Overage:ON",
   "accounts.overageOff": "Overage:OFF",

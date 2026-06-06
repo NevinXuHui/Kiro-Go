@@ -2218,9 +2218,13 @@ func (h *Handler) apiGetAccounts(w http.ResponseWriter, r *http.Request) {
 
 	// 隐藏敏感信息
 	result := make([]map[string]interface{}, len(accounts))
+	now := time.Now().Unix()
 	for i, a := range accounts {
 		// 获取运行时统计
 		stats := statsMap[a.ID]
+
+		// 判断账号是否活跃（最近30秒内使用过）
+		isActive := stats.LastUsed > 0 && (now-stats.LastUsed) <= 30
 
 		result[i] = map[string]interface{}{
 			"id":                a.ID,
@@ -2263,6 +2267,10 @@ func (h *Handler) apiGetAccounts(w http.ResponseWriter, r *http.Request) {
 			"totalTokens":       stats.TotalTokens,
 			"totalCredits":      stats.TotalCredits,
 			"lastUsed":          stats.LastUsed,
+			"isActive":          isActive,
+			"dailyRequests":     stats.DailyRequests,
+			"dailyTokens":       stats.DailyTokens,
+			"dailyDate":         stats.DailyDate,
 		}
 	}
 	json.NewEncoder(w).Encode(result)
@@ -2929,11 +2937,11 @@ func (h *Handler) apiGetStatus(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"accounts":        h.pool.Count(),
 		"available":       h.pool.AvailableCount(),
-		"totalRequests":   h.totalRequests,
-		"successRequests": h.successRequests,
-		"failedRequests":  h.failedRequests,
-		"totalTokens":     h.totalTokens,
-		"totalCredits":    h.totalCredits,
+		"totalRequests":   atomic.LoadInt64(&h.totalRequests),
+		"successRequests": atomic.LoadInt64(&h.successRequests),
+		"failedRequests":  atomic.LoadInt64(&h.failedRequests),
+		"totalTokens":     atomic.LoadInt64(&h.totalTokens),
+		"totalCredits":    h.getCredits(),
 		"dailyRequests":   atomic.LoadInt64(&h.dailyRequests),
 		"dailyTokens":     atomic.LoadInt64(&h.dailyTokens),
 		"dailyDate":       time.Now().Format("2006-01-02"),
