@@ -433,7 +433,6 @@ func (h *Handler) handleHealth(w http.ResponseWriter, r *http.Request) {
 
 // handleStats 统计数据（需要 API Key 鉴权）
 func (h *Handler) handleStats(w http.ResponseWriter, r *http.Request) {
-	dailyReq, dailyTokens, dailyDate := config.GetDailyStats()
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"status":          "ok",
@@ -445,9 +444,9 @@ func (h *Handler) handleStats(w http.ResponseWriter, r *http.Request) {
 		"failedRequests":  atomic.LoadInt64(&h.failedRequests),
 		"totalTokens":     atomic.LoadInt64(&h.totalTokens),
 		"totalCredits":    h.getCredits(),
-		"dailyRequests":   dailyReq,
-		"dailyTokens":     dailyTokens,
-		"dailyDate":       dailyDate,
+		"dailyRequests":   atomic.LoadInt64(&h.dailyRequests),
+		"dailyTokens":     atomic.LoadInt64(&h.dailyTokens),
+		"dailyDate":       time.Now().Format("2006-01-02"),
 		"uptime":          time.Now().Unix() - h.startTime,
 	})
 }
