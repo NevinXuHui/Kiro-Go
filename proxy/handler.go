@@ -2934,6 +2934,9 @@ func (h *Handler) apiGetStatus(w http.ResponseWriter, r *http.Request) {
 		"failedRequests":  h.failedRequests,
 		"totalTokens":     h.totalTokens,
 		"totalCredits":    h.totalCredits,
+		"dailyRequests":   atomic.LoadInt64(&h.dailyRequests),
+		"dailyTokens":     atomic.LoadInt64(&h.dailyTokens),
+		"dailyDate":       time.Now().Format("2006-01-02"),
 		"uptime":          time.Now().Unix() - h.startTime,
 	})
 }
