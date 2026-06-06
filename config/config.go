@@ -107,6 +107,11 @@ type Account struct {
 	LastUsed     int64   `json:"lastUsed,omitempty"`     // Last request timestamp
 	TotalTokens  int     `json:"totalTokens,omitempty"`  // Cumulative tokens processed
 	TotalCredits float64 `json:"totalCredits,omitempty"` // Cumulative credits consumed
+
+	// Daily statistics (reset at midnight)
+	DailyRequests int    `json:"dailyRequests,omitempty"` // Today's requests
+	DailyTokens   int    `json:"dailyTokens,omitempty"`   // Today's tokens
+	DailyDate     string `json:"dailyDate,omitempty"`     // Current date in YYYY-MM-DD format
 }
 
 // PromptFilterRule defines a single custom prompt sanitization rule.
@@ -213,6 +218,11 @@ type Config struct {
 	FailedRequests  int     `json:"failedRequests,omitempty"`  // Failed requests count
 	TotalTokens     int     `json:"totalTokens,omitempty"`     // Total tokens processed
 	TotalCredits    float64 `json:"totalCredits,omitempty"`    // Total credits consumed
+
+	// Daily statistics (reset at midnight)
+	DailyRequests int    `json:"dailyRequests,omitempty"` // Today's total requests
+	DailyTokens   int    `json:"dailyTokens,omitempty"`   // Today's total tokens
+	DailyDate     string `json:"dailyDate,omitempty"`     // Current date in YYYY-MM-DD format
 }
 
 // AccountInfo contains account metadata retrieved from Kiro API.
@@ -598,6 +608,57 @@ func GetStats() (int, int, int, int, float64) {
 	return cfg.TotalRequests, cfg.SuccessRequests, cfg.FailedRequests, cfg.TotalTokens, cfg.TotalCredits
 }
 
+// UpdateDailyStats updates daily statistics with automatic reset on date change
+func UpdateDailyStats(dailyReq, dailyTokens int) error {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+
+	today := time.Now().Format("2006-01-02")
+
+	// Reset daily stats if date has changed
+	if cfg.DailyDate != today {
+		cfg.DailyRequests = 0
+		cfg.DailyTokens = 0
+		cfg.DailyDate = today
+	}
+
+	cfg.DailyRequests = dailyReq
+	cfg.DailyTokens = dailyTokens
+	return Save()
+}
+
+// GetDailyStats returns daily statistics (requests, tokens, date)
+func GetDailyStats() (int, int, string) {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+
+	today := time.Now().Format("2006-01-02")
+
+	// If date doesn't match, return zero stats
+	if cfg.DailyDate != today {
+		return 0, 0, today
+	}
+
+	return cfg.DailyRequests, cfg.DailyTokens, cfg.DailyDate
+}
+
+// ResetDailyStatsIfNeeded checks and resets daily stats at midnight
+func ResetDailyStatsIfNeeded() error {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+
+	today := time.Now().Format("2006-01-02")
+
+	if cfg.DailyDate != today {
+		cfg.DailyRequests = 0
+		cfg.DailyTokens = 0
+		cfg.DailyDate = today
+		return Save()
+	}
+
+	return nil
+}
+
 func UpdateAccountStats(id string, requestCount, errorCount, totalTokens int, totalCredits float64, lastUsed int64) error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
@@ -610,6 +671,72 @@ func UpdateAccountStats(id string, requestCount, errorCount, totalTokens int, to
 			cfg.Accounts[i].LastUsed = lastUsed
 			return Save()
 		}
+	}
+	return nil
+}
+
+// UpdateAccountDailyStats updates daily statistics for an account with automatic reset on date change
+func UpdateAccountDailyStats(id string, dailyReq, dailyTokens int) error {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+
+	today := time.Now().Format("2006-01-02")
+
+	for i, a := range cfg.Accounts {
+		if a.ID == id {
+			// Reset daily stats if date has changed
+			if cfg.Accounts[i].DailyDate != today {
+				cfg.Accounts[i].DailyRequests = 0
+				cfg.Accounts[i].DailyTokens = 0
+				cfg.Accounts[i].DailyDate = today
+			}
+
+			cfg.Accounts[i].DailyRequests = dailyReq
+			cfg.Accounts[i].DailyTokens = dailyTokens
+			return Save()
+		}
+	}
+	return nil
+}
+
+// GetAccountDailyStats returns daily statistics for an account (requests, tokens, date)
+func GetAccountDailyStats(id string) (int, int, string) {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+
+	today := time.Now().Format("2006-01-02")
+
+	for _, a := range cfg.Accounts {
+		if a.ID == id {
+			// If date doesn't match, return zero stats
+			if a.DailyDate != today {
+				return 0, 0, today
+			}
+			return a.DailyRequests, a.DailyTokens, a.DailyDate
+		}
+	}
+	return 0, 0, today
+}
+
+// ResetAccountDailyStatsIfNeeded checks and resets daily stats for all accounts at midnight
+func ResetAccountDailyStatsIfNeeded() error {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+
+	today := time.Now().Format("2006-01-02")
+	changed := false
+
+	for i := range cfg.Accounts {
+		if cfg.Accounts[i].DailyDate != today && cfg.Accounts[i].DailyDate != "" {
+			cfg.Accounts[i].DailyRequests = 0
+			cfg.Accounts[i].DailyTokens = 0
+			cfg.Accounts[i].DailyDate = today
+			changed = true
+		}
+	}
+
+	if changed {
+		return Save()
 	}
 	return nil
 }

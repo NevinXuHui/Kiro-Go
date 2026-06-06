@@ -663,6 +663,8 @@
     $('statSuccess').textContent = d.successRequests || 0;
     $('statFailed').textContent = d.failedRequests || 0;
     $('statTokens').textContent = formatNum(d.totalTokens || 0);
+    $('statDailyRequests').textContent = d.dailyRequests || 0;
+    $('statDailyTokens').textContent = formatNum(d.dailyTokens || 0);
   }
   async function loadAccounts() {
     const res = await api('/accounts');
@@ -961,6 +963,8 @@
         '<div class="account-stats">' +
         '<div class="account-stat"><div class="account-stat-value">' + (a.requestCount || 0) + '</div><div class="account-stat-label">' + escapeHtml(t('accounts.requests')) + '</div></div>' +
         '<div class="account-stat"><div class="account-stat-value">' + formatNum(a.totalTokens || 0) + '</div><div class="account-stat-label">' + escapeHtml(t('accounts.tokens')) + '</div></div>' +
+        '<div class="account-stat"><div class="account-stat-value account-stat-value--primary">' + (a.dailyRequests || 0) + '</div><div class="account-stat-label">' + escapeHtml(t('accounts.dailyRequests')) + '</div></div>' +
+        '<div class="account-stat"><div class="account-stat-value account-stat-value--primary">' + formatNum(a.dailyTokens || 0) + '</div><div class="account-stat-label">' + escapeHtml(t('accounts.dailyTokens')) + '</div></div>' +
         '<div class="account-stat"><div class="account-stat-value">' + (a.totalCredits || 0).toFixed(1) + '</div><div class="account-stat-label">' + escapeHtml(t('accounts.credits')) + '</div></div>' +
         '<div class="account-stat"><div class="account-stat-value">' + escapeHtml(formatTokenExpiry(a.expiresAt)) + '</div><div class="account-stat-label">' + escapeHtml(t('accounts.expiry')) + '</div></div>' +
         '</div>' +
@@ -1285,6 +1289,8 @@
       detailItem(t('detail.errorCount'), a.errorCount || 0) +
       detailItem(t('detail.totalTokens'), formatNum(a.totalTokens || 0)) +
       detailItem(t('detail.totalCredits'), (a.totalCredits || 0).toFixed(2)) +
+      detailItem(t('detail.dailyRequests'), a.dailyRequests || 0) +
+      detailItem(t('detail.dailyTokens'), formatNum(a.dailyTokens || 0)) +
       '</div></div>' +
 
       '<div class="detail-section">' +

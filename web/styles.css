@@ -1224,6 +1224,9 @@ img.brand-icon {
 .stat-value--danger {
   color: var(--destructive) !important;
 }
+.stat-value-primary {
+  color: var(--info);
+}
 .stat-label {
   font-size: 0.75rem;
   font-weight: 500;
@@ -1231,6 +1234,18 @@ img.brand-icon {
   color: var(--muted-foreground);
   text-transform: uppercase;
   letter-spacing: 0.04em;
+}
+/* Daily stats styling */
+.stat-sub--daily {
+  margin-top: 0.5rem;
+  padding-top: 0.5rem;
+  border-top: 1px solid var(--border);
+  gap: 0.75rem;
+}
+.stat-daily-icon {
+  font-size: 0.875rem;
+  color: var(--info);
+  opacity: 0.8;
 }
 .stat-sep {
   font-size: 0.75rem;
@@ -1771,6 +1786,9 @@ img.brand-icon {
   font-weight: 600;
   font-feature-settings: "tnum";
   color: var(--foreground);
+}
+.account-stat-value--primary {
+  color: var(--info);
 }
 .account-stat-label {
   font-size: 0.625rem;

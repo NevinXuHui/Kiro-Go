@@ -439,19 +439,34 @@ func (p *AccountPool) UpdateStats(id string, tokens int, credits float64) {
 	var requestCount, errorCount, totalTokens int
 	var totalCredits float64
 	var lastUsed int64
+	var dailyRequests, dailyTokens int
+	today := time.Now().Format("2006-01-02")
+
 	for i := range p.accounts {
 		if p.accounts[i].ID == id {
 			if !updated {
+				// 更新全局统计
 				p.accounts[i].RequestCount++
 				p.accounts[i].TotalTokens += tokens
 				p.accounts[i].TotalCredits += credits
 				p.accounts[i].LastUsed = time.Now().Unix()
+
+				// 更新每日统计
+				if p.accounts[i].DailyDate != today {
+					p.accounts[i].DailyRequests = 0
+					p.accounts[i].DailyTokens = 0
+					p.accounts[i].DailyDate = today
+				}
+				p.accounts[i].DailyRequests++
+				p.accounts[i].DailyTokens += tokens
 
 				requestCount = p.accounts[i].RequestCount
 				errorCount = p.accounts[i].ErrorCount
 				totalTokens = p.accounts[i].TotalTokens
 				totalCredits = p.accounts[i].TotalCredits
 				lastUsed = p.accounts[i].LastUsed
+				dailyRequests = p.accounts[i].DailyRequests
+				dailyTokens = p.accounts[i].DailyTokens
 				updated = true
 				continue
 			}
@@ -460,10 +475,14 @@ func (p *AccountPool) UpdateStats(id string, tokens int, credits float64) {
 			p.accounts[i].TotalTokens = totalTokens
 			p.accounts[i].TotalCredits = totalCredits
 			p.accounts[i].LastUsed = lastUsed
+			p.accounts[i].DailyRequests = dailyRequests
+			p.accounts[i].DailyTokens = dailyTokens
+			p.accounts[i].DailyDate = today
 		}
 	}
 	if updated {
 		go config.UpdateAccountStats(id, requestCount, errorCount, totalTokens, totalCredits, lastUsed)
+		go config.UpdateAccountDailyStats(id, dailyRequests, dailyTokens)
 	}
 }
 

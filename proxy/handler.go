@@ -32,6 +32,9 @@ type Handler struct {
 	startTime       int64
 	stopRefresh     chan struct{}
 	stopStatsSaver  chan struct{}
+	// 每日统计 (使用原子操作)
+	dailyRequests int64
+	dailyTokens   int64
 	// 模型缓存
 	cachedModels    []ModelInfo
 	modelsCacheMu   sync.RWMutex
@@ -214,6 +217,7 @@ func NewHandler() *Handler {
 	applyProxyConfig(config.GetProxyURL())
 
 	totalReq, successReq, failedReq, totalTokens, totalCredits := config.GetStats()
+	dailyReq, dailyTokens, _ := config.GetDailyStats()
 	h := &Handler{
 		pool:            pool.GetPool(),
 		totalRequests:   int64(totalReq),
@@ -221,6 +225,8 @@ func NewHandler() *Handler {
 		failedRequests:  int64(failedReq),
 		totalTokens:     int64(totalTokens),
 		totalCredits:    totalCredits,
+		dailyRequests:   int64(dailyReq),
+		dailyTokens:     int64(dailyTokens),
 		startTime:       time.Now().Unix(),
 		stopRefresh:     make(chan struct{}),
 		stopStatsSaver:  make(chan struct{}),
@@ -230,6 +236,8 @@ func NewHandler() *Handler {
 	go h.backgroundRefresh()
 	// 启动后台统计保存 (每30秒保存一次)
 	go h.backgroundStatsSaver()
+	// 启动后台每日重置检查 (每小时检查一次)
+	go h.backgroundDailyReset()
 	// 清理过期的 stored responses（>30 天）
 	go purgeExpiredResponses(responsesDefaultTTL)
 	return h
@@ -425,6 +433,7 @@ func (h *Handler) handleHealth(w http.ResponseWriter, r *http.Request) {
 
 // handleStats 统计数据（需要 API Key 鉴权）
 func (h *Handler) handleStats(w http.ResponseWriter, r *http.Request) {
+	dailyReq, dailyTokens, dailyDate := config.GetDailyStats()
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"status":          "ok",
@@ -436,6 +445,9 @@ func (h *Handler) handleStats(w http.ResponseWriter, r *http.Request) {
 		"failedRequests":  atomic.LoadInt64(&h.failedRequests),
 		"totalTokens":     atomic.LoadInt64(&h.totalTokens),
 		"totalCredits":    h.getCredits(),
+		"dailyRequests":   dailyReq,
+		"dailyTokens":     dailyTokens,
+		"dailyDate":       dailyDate,
 		"uptime":          time.Now().Unix() - h.startTime,
 	})
 }
@@ -1297,6 +1309,37 @@ func (h *Handler) saveStats() {
 		int(atomic.LoadInt64(&h.totalTokens)),
 		h.getCredits(),
 	)
+	// 保存每日统计
+	config.UpdateDailyStats(
+		int(atomic.LoadInt64(&h.dailyRequests)),
+		int(atomic.LoadInt64(&h.dailyTokens)),
+	)
+}
+
+// backgroundDailyReset 后台定期检查并重置每日统计
+func (h *Handler) backgroundDailyReset() {
+	ticker := time.NewTicker(1 * time.Hour) // 每小时检查一次
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			// 检查日期是否变化，如果变了就重置
+			dailyReq, dailyTokens, savedDate := config.GetDailyStats()
+			today := time.Now().Format("2006-01-02")
+
+			if savedDate != today {
+				// 重置内存中的计数器
+				atomic.StoreInt64(&h.dailyRequests, 0)
+				atomic.StoreInt64(&h.dailyTokens, 0)
+				// 重置配置文件中的统计
+				config.ResetDailyStatsIfNeeded()
+				logger.Infof("[DailyReset] Daily stats reset: previous date=%s, requests=%d, tokens=%d", savedDate, dailyReq, dailyTokens)
+			}
+		case <-h.stopRefresh:
+			return
+		}
+	}
 }
 
 // getCredits 线程安全获取 credits
@@ -1319,6 +1362,9 @@ func (h *Handler) recordSuccess(inputTokens, outputTokens int, credits float64) 
 	atomic.AddInt64(&h.successRequests, 1)
 	atomic.AddInt64(&h.totalTokens, int64(inputTokens+outputTokens))
 	h.addCredits(credits)
+	// 增加每日统计
+	atomic.AddInt64(&h.dailyRequests, 1)
+	atomic.AddInt64(&h.dailyTokens, int64(inputTokens+outputTokens))
 }
 
 // recordSuccessForApiKey is recordSuccess + per-API-key usage attribution.
@@ -1337,6 +1383,8 @@ func (h *Handler) recordSuccessForApiKey(apiKeyID string, inputTokens, outputTok
 func (h *Handler) recordFailure() {
 	atomic.AddInt64(&h.totalRequests, 1)
 	atomic.AddInt64(&h.failedRequests, 1)
+	// 增加每日统计
+	atomic.AddInt64(&h.dailyRequests, 1)
 }
 
 // handleClaudeNonStream Claude 非流式响应
