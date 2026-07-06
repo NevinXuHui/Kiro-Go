@@ -482,6 +482,7 @@ func (p *AccountPool) UpdateStats(id string, tokens int, credits float64) {
 	}
 	if updated {
 		go config.UpdateAccountStats(id, requestCount, errorCount, totalTokens, totalCredits, lastUsed)
+		// 更新每日统计，UpdateAccountDailyStats 会处理跨日期的情况
 		go config.UpdateAccountDailyStats(id, dailyRequests, dailyTokens)
 	}
 }

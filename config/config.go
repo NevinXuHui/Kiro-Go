@@ -14,6 +14,7 @@ import (
 	"crypto/rand"
 	"encoding/json"
 	"fmt"
+	"kiro-go/logger"
 	"os"
 	"runtime"
 	"sync"
@@ -615,13 +616,21 @@ func UpdateDailyStats(dailyReq, dailyTokens int) error {
 
 	today := time.Now().Format("2006-01-02")
 
-	// Reset daily stats if date has changed
+	// If date has changed, this is the first save after midnight
+	// The passed values are accumulated stats from the old day that need to be preserved
 	if cfg.DailyDate != today {
+		// Log the final stats from the previous day before resetting
+		logger.Infof("[DailyStats] Day changed from %s to %s, final stats: requests=%d, tokens=%d", 
+			cfg.DailyDate, today, dailyReq, dailyTokens)
+		
+		// Reset to 0 for the new day (discard old day's in-memory accumulation)
 		cfg.DailyRequests = 0
 		cfg.DailyTokens = 0
 		cfg.DailyDate = today
+		return Save()
 	}
 
+	// Same day: update with current values
 	cfg.DailyRequests = dailyReq
 	cfg.DailyTokens = dailyTokens
 	return Save()
@@ -684,13 +693,20 @@ func UpdateAccountDailyStats(id string, dailyReq, dailyTokens int) error {
 
 	for i, a := range cfg.Accounts {
 		if a.ID == id {
-			// Reset daily stats if date has changed
+			// If date has changed, this is the first save after midnight
 			if cfg.Accounts[i].DailyDate != today {
+				// Log the final stats from the previous day before resetting
+				logger.Infof("[DailyStats] Account %s day changed from %s to %s, final stats: requests=%d, tokens=%d", 
+					a.Email, cfg.Accounts[i].DailyDate, today, dailyReq, dailyTokens)
+				
+				// Reset to 0 for the new day
 				cfg.Accounts[i].DailyRequests = 0
 				cfg.Accounts[i].DailyTokens = 0
 				cfg.Accounts[i].DailyDate = today
+				return Save()
 			}
 
+			// Same day: update with current values
 			cfg.Accounts[i].DailyRequests = dailyReq
 			cfg.Accounts[i].DailyTokens = dailyTokens
 			return Save()

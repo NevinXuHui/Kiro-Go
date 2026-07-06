@@ -21,6 +21,37 @@
 
 ## 快速开始
 
+### systemd 服务部署（Linux 推荐）
+
+适合在 Linux 服务器上作为系统服务长期运行：
+
+```bash
+# 1. 克隆项目并编译
+git clone https://github.com/Quorinex/Kiro-Go.git
+cd Kiro-Go
+go build -o kiro-go
+
+# 2. 运行安装脚本（默认安装到 /opt/kiro-go）
+sudo ./install-service.sh
+
+# 3. 查看服务状态
+sudo systemctl status kiro-go
+
+# 4. 查看日志
+sudo journalctl -u kiro-go -f
+```
+
+安装完成后访问 `http://localhost:8080/admin` 管理账号。
+
+**服务管理命令：**
+- 启动：`sudo systemctl start kiro-go`
+- 停止：`sudo systemctl stop kiro-go`
+- 重启：`sudo systemctl restart kiro-go`
+- 查看状态：`sudo systemctl status kiro-go`
+- 查看日志：`sudo journalctl -u kiro-go -f`
+
+详细部署文档请参考 [DEPLOY.md](DEPLOY.md)
+
 ### Docker Compose（推荐）
 
 ```bash

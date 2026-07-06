@@ -1,20 +1,27 @@
 [Unit]
-Description=Kiro-Go API Service
+Description=Kiro-Go Account Management Service
 After=network.target
 
 [Service]
 Type=simple
 User=root
-WorkingDirectory=/mine/Code/ai-tools/Kiro-Go
-ExecStart=/mine/Code/ai-tools/Kiro-Go/kiro-go
-Restart=always
-RestartSec=5
-Environment="CONFIG_PATH=/mine/Code/ai-tools/Kiro-Go/data/config.json"
+WorkingDirectory=/root/Kiro-Go
+ExecStart=/root/Kiro-Go/kiro-go
+Restart=on-failure
+RestartSec=5s
+
+# 环境变量（可选）
+Environment="KIRO_PORT=8991"
+Environment="KIRO_LOG_LEVEL=info"
 
 # 日志
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=kiro-go
+
+# 安全加固（可选）
+# NoNewPrivileges=true
+# PrivateTmp=true
 
 [Install]
 WantedBy=multi-user.target

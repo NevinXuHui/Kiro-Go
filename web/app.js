@@ -654,7 +654,7 @@
     renderEndpointCode('openaiResponsesEndpoint', baseUrl + '/v1/responses');
     renderEndpointCode('modelsEndpoint', baseUrl + '/v1/models');
     renderEndpointCode('statsEndpoint', baseUrl + '/v1/stats');
-    setTimeout(checkUpdate, 2000);
+    // setTimeout(checkUpdate, 2000); // 已禁用自动检查更新
   }
   async function loadStats() {
     const res = await api('/status');
@@ -848,6 +848,26 @@
     const filtered = getFilteredAccounts();
     if (checked) filtered.forEach(a => selectedAccounts.add(a.id));
     else selectedAccounts.clear();
+    renderAccounts();
+    updateBatchBar();
+  }
+  function toggleSelectCurrentPage() {
+    const filtered = getFilteredAccounts();
+    const startIdx = (currentPage - 1) * pageSize;
+    const endIdx = Math.min(startIdx + pageSize, filtered.length);
+    const pageAccounts = filtered.slice(startIdx, endIdx);
+    
+    // 检查当前页是否全部选中
+    const allCurrentPageSelected = pageAccounts.every(a => selectedAccounts.has(a.id));
+    
+    if (allCurrentPageSelected) {
+      // 如果当前页全选了，则取消当前页的选择
+      pageAccounts.forEach(a => selectedAccounts.delete(a.id));
+    } else {
+      // 否则选择当前页
+      pageAccounts.forEach(a => selectedAccounts.add(a.id));
+    }
+    
     renderAccounts();
     updateBatchBar();
   }
@@ -1246,28 +1266,80 @@
       variant: action === 'disable' ? 'danger' : 'primary'
     });
     if (!ok) return;
-    const dismiss = toast(t('batch.processing'), 'info', { duration: 0 });
-    try {
-      const res = await api('/accounts/batch', { method: 'POST', body: JSON.stringify({ ids, action }) });
-      const d = await res.json();
-      if (!res.ok || !d.success) throw new Error(d.error || t('common.failed'));
-      dismiss();
-      if (action === 'refresh') {
-        toast(t('batch.refreshResult', d.refreshed || 0, d.failed || 0), d.failed ? 'warning' : 'success');
-      } else if (action === 'enable') {
-        toast(t('batch.enableResult', d.count || ids.length), 'success');
-      } else if (action === 'disable') {
-        toast(t('batch.disableResult', d.count || ids.length), 'success');
+    
+    let toastId = null;
+    let success = 0, fail = 0;
+    const total = ids.length;
+    
+    // 获取进度提示文本
+    let progressTextKey = 'batch.processing';
+    if (action === 'enable') progressTextKey = 'batch.enabling';
+    else if (action === 'disable') progressTextKey = 'batch.disabling';
+    else if (action === 'refresh') progressTextKey = 'batch.refreshing';
+    
+    for (let i = 0; i < ids.length; i++) {
+      const id = ids[i];
+      const current = i + 1;
+      const progress = t('batch.progress', current, total);
+      
+      if (toastId) {
+        // 更新现有 toast
+        const el = document.querySelector(`[data-toast-id="${toastId}"]`);
+        if (el) {
+          const msg = el.querySelector('.toast-message');
+          if (msg) msg.textContent = `${t(progressTextKey)} - ${progress}`;
+        }
       } else {
-        toast(t('batch.done'), 'success');
+        // 创建新 toast
+        toastId = Date.now().toString();
+        const el = document.createElement('div');
+        el.className = 'toast toast-info';
+        el.setAttribute('data-toast-id', toastId);
+        el.innerHTML = `<div class="toast-message">${escapeHtml(t(progressTextKey))} - ${progress}</div>`;
+        document.body.appendChild(el);
+        setTimeout(() => el.classList.add('toast-show'), 10);
       }
-      selectedAccounts.clear();
-      updateBatchBar();
-      loadAccounts(); loadStats();
-    } catch (e) {
-      dismiss();
-      toast((e && e.message) || t('common.failed'), 'error');
+      
+      try {
+        let res;
+        if (action === 'refresh') {
+          // 刷新账号状态
+          res = await api('/accounts/' + id + '/refresh', { method: 'POST' });
+        } else if (action === 'enable' || action === 'disable') {
+          // 更新启用/禁用状态
+          res = await api('/accounts/' + id, { 
+            method: 'PUT', 
+            body: JSON.stringify({ enabled: action === 'enable' }) 
+          });
+        }
+        const d = await res.json().catch(() => ({}));
+        if (res.ok && d.success !== false) success++; else fail++;
+      } catch { fail++; }
     }
+    
+    // 移除进度 toast
+    if (toastId) {
+      const el = document.querySelector(`[data-toast-id="${toastId}"]`);
+      if (el) {
+        el.classList.remove('toast-show');
+        setTimeout(() => el.remove(), 300);
+      }
+    }
+    
+    // 显示结果
+    if (action === 'refresh') {
+      toast(t('batch.refreshResult', success, fail), fail ? 'warning' : 'success');
+    } else if (action === 'enable') {
+      toast(t('batch.enableResult', success), fail ? 'warning' : 'success');
+    } else if (action === 'disable') {
+      toast(t('batch.disableResult', success), fail ? 'warning' : 'success');
+    } else {
+      toast(t('batch.done'), 'success');
+    }
+    
+    selectedAccounts.clear();
+    updateBatchBar();
+    loadAccounts(); loadStats();
   }
   async function batchRefreshModels() {
     const ids = Array.from(selectedAccounts);
@@ -1277,16 +1349,50 @@
       confirmText: t('common.confirm')
     });
     if (!confirmed) return;
-    const dismiss = toast(t('detail.refreshModelCache') + '…', 'info', { duration: 0 });
+    
+    let toastId = null;
     let ok = 0, fail = 0;
-    for (const id of ids) {
+    const total = ids.length;
+    
+    for (let i = 0; i < ids.length; i++) {
+      const id = ids[i];
+      const current = i + 1;
+      const progress = t('batch.progress', current, total);
+      
+      if (toastId) {
+        // 更新现有 toast
+        const el = document.querySelector(`[data-toast-id="${toastId}"]`);
+        if (el) {
+          const msg = el.querySelector('.toast-message');
+          if (msg) msg.textContent = `${t('detail.refreshModelCache')} - ${progress}`;
+        }
+      } else {
+        // 创建新 toast
+        toastId = Date.now().toString();
+        const el = document.createElement('div');
+        el.className = 'toast toast-info';
+        el.setAttribute('data-toast-id', toastId);
+        el.innerHTML = `<div class="toast-message">${escapeHtml(t('detail.refreshModelCache'))} - ${progress}</div>`;
+        document.body.appendChild(el);
+        setTimeout(() => el.classList.add('toast-show'), 10);
+      }
+      
       try {
         const res = await api('/accounts/' + id + '/models/refresh', { method: 'POST' });
         const d = await res.json();
         if (d.success) ok++; else fail++;
       } catch { fail++; }
     }
-    dismiss();
+    
+    // 移除进度 toast
+    if (toastId) {
+      const el = document.querySelector(`[data-toast-id="${toastId}"]`);
+      if (el) {
+        el.classList.remove('toast-show');
+        setTimeout(() => el.remove(), 300);
+      }
+    }
+    
     toast(t('batch.refreshModelsResult', ok, fail), fail ? 'warning' : 'success');
     selectedAccounts.clear();
     updateBatchBar();
@@ -1301,16 +1407,50 @@
       variant: 'danger'
     });
     if (!confirmed) return;
-    const dismiss = toast(t('batch.deleting'), 'info', { duration: 0 });
+    
+    let toastId = null;
     let ok = 0, fail = 0;
-    for (const id of ids) {
+    const total = ids.length;
+    
+    for (let i = 0; i < ids.length; i++) {
+      const id = ids[i];
+      const current = i + 1;
+      const progress = t('batch.progress', current, total);
+      
+      if (toastId) {
+        // 更新现有 toast
+        const el = document.querySelector(`[data-toast-id="${toastId}"]`);
+        if (el) {
+          const msg = el.querySelector('.toast-message');
+          if (msg) msg.textContent = `${t('batch.deleting')} - ${progress}`;
+        }
+      } else {
+        // 创建新 toast
+        toastId = Date.now().toString();
+        const el = document.createElement('div');
+        el.className = 'toast toast-info';
+        el.setAttribute('data-toast-id', toastId);
+        el.innerHTML = `<div class="toast-message">${escapeHtml(t('batch.deleting'))} - ${progress}</div>`;
+        document.body.appendChild(el);
+        setTimeout(() => el.classList.add('toast-show'), 10);
+      }
+      
       try {
         const res = await api('/accounts/' + id, { method: 'DELETE' });
         const d = await res.json().catch(() => ({}));
         if (res.ok && d.success !== false) ok++; else fail++;
       } catch { fail++; }
     }
-    dismiss();
+    
+    // 移除进度 toast
+    if (toastId) {
+      const el = document.querySelector(`[data-toast-id="${toastId}"]`);
+      if (el) {
+        el.classList.remove('toast-show');
+        setTimeout(() => el.remove(), 300);
+      }
+    }
+    
     toast(t('batch.deleteResult', ok, fail), fail ? 'warning' : 'success', { icon: 'fa-solid fa-trash' });
     selectedAccounts.clear();
     updateBatchBar();
@@ -2369,6 +2509,21 @@
       '<div class="form-group"><label>' + escapeHtml(t('credentials.label')) + '</label>' +
       '<textarea id="credJson" class="font-mono" placeholder=\'[{"refreshToken":"xxx","provider":"BuilderID"}]&#10;or&#10;email----password----refreshToken----clientId----clientSecret\'></textarea>' +
       '</div>' +
+      '<div id="importProgressContainer" class="import-progress-container hidden">' +
+      '<div class="import-progress-header">' +
+      '<span class="import-progress-status" id="importProgressStatus"></span>' +
+      '<span class="import-progress-count" id="importProgressCount"></span>' +
+      '</div>' +
+      '<div class="import-progress-bar">' +
+      '<div class="import-progress-fill" id="importProgressFill"></div>' +
+      '</div>' +
+      '<div class="import-progress-summary">' +
+      '<div class="import-progress-stat success"><i>✓</i><span id="importProgressSuccess">0</span></div>' +
+      '<div class="import-progress-stat error"><i>✗</i><span id="importProgressFailed">0</span></div>' +
+      '<div class="import-progress-stat pending" id="importProgressSkippedStat"><i>⊘</i><span id="importProgressSkipped">0</span></div>' +
+      '<div class="import-progress-stat pending"><i>⋯</i><span id="importProgressPending">0</span></div>' +
+      '</div>' +
+      '</div>' +
       '<div class="modal-footer">' +
       '<button class="btn btn-secondary" data-modal-goto="add" type="button">' + escapeHtml(t('common.back')) + '</button>' +
       '<button class="btn btn-primary" id="importCredBtn" type="button">' + escapeHtml(t('common.add')) + '</button>' +
@@ -2480,9 +2635,45 @@
         return;
       }
     }
-    let ok = 0, fail = 0, newIds = [];
-    for (const item of items) {
-      if (!item.refreshToken) { fail++; continue; }
+
+    // 显示进度容器
+    const progressContainer = $('importProgressContainer');
+    const progressStatus = $('importProgressStatus');
+    const progressCount = $('importProgressCount');
+    const progressFill = $('importProgressFill');
+    const progressSuccess = $('importProgressSuccess');
+    const progressFailed = $('importProgressFailed');
+    const progressSkipped = $('importProgressSkipped');
+    const progressPending = $('importProgressPending');
+    const importBtn = $('importCredBtn');
+
+    progressContainer.classList.remove('hidden');
+    importBtn.disabled = true;
+
+    const total = items.length;
+    let ok = 0, fail = 0, skippedCount = 0, newIds = [];
+
+    // 初始化进度显示
+    progressStatus.textContent = t('import.progress.importing');
+    progressCount.textContent = `0/${total}`;
+    progressFill.style.width = '0%';
+    progressSuccess.textContent = '0';
+    progressFailed.textContent = '0';
+    progressSkipped.textContent = '0';
+    progressPending.textContent = total;
+
+    // 并发控制：同时处理多个导入请求
+    const CONCURRENT_LIMIT = 100;
+    let completed = 0;
+
+    // 处理单个账号导入
+    const processItem = async (item, index) => {
+      if (!item.refreshToken) {
+        fail++;
+        progressFailed.textContent = fail;
+        return;
+      }
+
       let authMethod = item.authMethod || '';
       if (item.clientId && item.clientSecret) authMethod = 'idc';
       else if (!authMethod || authMethod === 'social') authMethod = 'social';
@@ -2498,19 +2689,58 @@
         authMethod, provider,
         region: item.region || 'us-east-1'
       };
+
       try {
         const res = await api('/auth/credentials', { method: 'POST', body: JSON.stringify(payload) });
         const d = await res.json();
-        if (d.success) { ok++; if (d.account?.id) newIds.push(d.account.id); }
-        else fail++;
-      } catch { fail++; }
+        if (d.success) {
+          if (d.duplicate) {
+            skippedCount++;
+            progressSkipped.textContent = skippedCount;
+          } else {
+            ok++;
+            if (d.account?.id) newIds.push(d.account.id);
+            progressSuccess.textContent = ok;
+          }
+        } else {
+          fail++;
+          progressFailed.textContent = fail;
+        }
+      } catch {
+        fail++;
+        progressFailed.textContent = fail;
+      }
+
+      // 更新进度
+      completed++;
+      progressPending.textContent = total - completed;
+      progressFill.style.width = `${(completed / total) * 100}%`;
+      progressCount.textContent = `${completed}/${total}`;
+      progressStatus.textContent = t('import.progress.processing', completed, total);
+      if (fail > 0) progressFill.classList.add('with-errors');
+    };
+
+    // 批量并发处理
+    for (let i = 0; i < items.length; i += CONCURRENT_LIMIT) {
+      const batch = items.slice(i, i + CONCURRENT_LIMIT);
+      await Promise.all(batch.map((item, idx) => processItem(item, i + idx)));
     }
-    closeModal(); loadAccounts(); loadStats();
-    let msg = t('sso.importSuccess', ok);
-    if (fail > 0) msg += t('sso.importPartial', fail);
-    if (skipped > 0) msg += t('credentials.lineParseSkipped', skipped);
-    toastPrimary(msg, { duration: 5200 });
-    newIds.forEach(autoRefreshNewAccount);
+
+    // 显示完成状态
+    progressStatus.textContent = t('import.progress.completed');
+
+    // 延迟关闭模态框，让用户看到最终结果
+    setTimeout(() => {
+      closeModal();
+      loadAccounts();
+      loadStats();
+      let msg = t('sso.importSuccess', ok);
+      if (fail > 0) msg += t('sso.importPartial', fail);
+      if (skippedCount > 0) msg += ` (${t('import.progress.skipped')}: ${skippedCount})`;
+      if (skipped > 0) msg += t('credentials.lineParseSkipped', skipped);
+      toastPrimary(msg, { duration: 5200 });
+      newIds.forEach(autoRefreshNewAccount);
+    }, 1500);
   }
   function parseLineCredentials(text) {
     const items = [];
@@ -2947,6 +3177,7 @@
     $('addAccountBtn').addEventListener('click', () => showModal('add'));
 
     $('selectAllCheckbox').addEventListener('change', e => toggleSelectAll(e.target.checked));
+    $('selectCurrentPageBtn').addEventListener('click', toggleSelectCurrentPage);
     qsa('[data-batch]').forEach(b => b.addEventListener('click', () => {
       const a = b.dataset.batch;
       if (a === 'refreshModels') batchRefreshModels();

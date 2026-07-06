@@ -348,6 +348,7 @@
   "batch.delete": "Batch Delete",
   "batch.selected": "{0} selected",
   "batch.selectAll": "Select All",
+  "batch.selectCurrentPage": "Current Page",
   "batch.processing": "Processing selected accounts...",
   "batch.enableResult": "Enabled {0} accounts",
   "batch.disableResult": "Disabled {0} accounts",
@@ -360,7 +361,11 @@
   "batch.confirmDelete": "Delete {0} selected accounts? This cannot be undone.",
   "batch.deleteResult": "Delete done: {0} success, {1} failed",
   "batch.deleting": "Deleting selected accounts...",
+  "batch.enabling": "Enabling selected accounts...",
+  "batch.disabling": "Disabling selected accounts...",
+  "batch.refreshing": "Refreshing selected accounts...",
   "batch.done": "Done",
+  "batch.progress": "Progress: {0}/{1}",
   "filter.search": "Search email/nickname...",
   "filter.status": "Account status",
   "filter.all": "All",
@@ -505,5 +510,12 @@
   "errors.typeSuspended": "Suspended",
   "errors.typeOverage": "Overage",
   "errors.typeProfile": "Profile",
-  "errors.typeUnknown": "Unknown"
+  "errors.typeUnknown": "Unknown",
+  "import.progress.importing": "Importing...",
+  "import.progress.processing": "Processing {current}/{total} accounts",
+  "import.progress.completed": "Import completed",
+  "import.progress.success": "Success",
+  "import.progress.failed": "Failed",
+  "import.progress.pending": "Pending",
+  "import.progress.skipped": "Skipped"
 }

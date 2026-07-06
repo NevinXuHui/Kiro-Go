@@ -1329,7 +1329,8 @@ func (h *Handler) saveStats() {
 		int(atomic.LoadInt64(&h.totalTokens)),
 		h.getCredits(),
 	)
-	// 保存每日统计
+	// 保存每日统计 - 无论日期是否匹配都要保存
+	// 如果日期不匹配，UpdateDailyStats 会处理跨日期的情况
 	config.UpdateDailyStats(
 		int(atomic.LoadInt64(&h.dailyRequests)),
 		int(atomic.LoadInt64(&h.dailyTokens)),
@@ -1338,7 +1339,7 @@ func (h *Handler) saveStats() {
 
 // backgroundDailyReset 后台定期检查并重置每日统计
 func (h *Handler) backgroundDailyReset() {
-	ticker := time.NewTicker(1 * time.Hour) // 每小时检查一次
+	ticker := time.NewTicker(5 * time.Minute) // 每5分钟检查一次，更及时
 	defer ticker.Stop()
 
 	for {
@@ -3010,6 +3011,25 @@ func (h *Handler) apiImportCredentials(w http.ResponseWriter, r *http.Request) {
 
 	// 获取用户信息
 	email, _, _ := auth.GetUserInfo(accessToken)
+
+	// 检查去重：通过 email 或 refreshToken 判断是否已存在
+	existingAccounts := config.GetAccounts()
+	for _, existing := range existingAccounts {
+		// 如果 email 相同或 refreshToken 相同，认为是重复账号
+		if (email != "" && existing.Email == email) ||
+		   (req.RefreshToken != "" && existing.RefreshToken == req.RefreshToken) {
+			w.WriteHeader(200)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"success":   true,
+				"duplicate": true,
+				"account": map[string]interface{}{
+					"id":    existing.ID,
+					"email": existing.Email,
+				},
+			})
+			return
+		}
+	}
 
 	// 创建账号
 	account := config.Account{

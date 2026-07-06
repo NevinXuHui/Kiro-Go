@@ -21,6 +21,37 @@ If this project helps you, a Star would mean a lot.
 
 ## Quick Start
 
+### systemd Service Deployment (Linux Recommended)
+
+For long-term production deployment on Linux servers:
+
+```bash
+# 1. Clone and build
+git clone https://github.com/Quorinex/Kiro-Go.git
+cd Kiro-Go
+go build -o kiro-go
+
+# 2. Run installation script (installs to /opt/kiro-go by default)
+sudo ./install-service.sh
+
+# 3. Check service status
+sudo systemctl status kiro-go
+
+# 4. View logs
+sudo journalctl -u kiro-go -f
+```
+
+After installation, visit `http://localhost:8080/admin` to manage accounts.
+
+**Service Management:**
+- Start: `sudo systemctl start kiro-go`
+- Stop: `sudo systemctl stop kiro-go`
+- Restart: `sudo systemctl restart kiro-go`
+- Status: `sudo systemctl status kiro-go`
+- Logs: `sudo journalctl -u kiro-go -f`
+
+For detailed deployment guide, see [DEPLOY.md](DEPLOY.md)
+
 ### Docker Compose (Recommended)
 
 ```bash
