@@ -221,9 +221,11 @@ type Config struct {
 	TotalCredits    float64 `json:"totalCredits,omitempty"`    // Total credits consumed
 
 	// Daily statistics (reset at midnight)
-	DailyRequests int    `json:"dailyRequests,omitempty"` // Today's total requests
-	DailyTokens   int    `json:"dailyTokens,omitempty"`   // Today's total tokens
-	DailyDate     string `json:"dailyDate,omitempty"`     // Current date in YYYY-MM-DD format
+	DailyRequests        int    `json:"dailyRequests,omitempty"`        // Today's total requests
+	DailySuccessRequests int    `json:"dailySuccessRequests,omitempty"` // Today's successful requests
+	DailyFailedRequests  int    `json:"dailyFailedRequests,omitempty"`  // Today's failed requests
+	DailyTokens          int    `json:"dailyTokens,omitempty"`          // Today's total tokens
+	DailyDate            string `json:"dailyDate,omitempty"`            // Current date in YYYY-MM-DD format
 }
 
 // AccountInfo contains account metadata retrieved from Kiro API.
@@ -609,46 +611,43 @@ func GetStats() (int, int, int, int, float64) {
 	return cfg.TotalRequests, cfg.SuccessRequests, cfg.FailedRequests, cfg.TotalTokens, cfg.TotalCredits
 }
 
-// UpdateDailyStats updates daily statistics with automatic reset on date change
-func UpdateDailyStats(dailyReq, dailyTokens int) error {
+// UpdateDailyStats updates daily statistics with automatic reset on date change.
+// Callers must pass already day-aligned counters (memory rolled to "today").
+// On date change we adopt the caller's values rather than forcing zero, so a
+// concurrent first request of the new day is not discarded.
+func UpdateDailyStats(dailyReq, dailySuccess, dailyFailed, dailyTokens int) error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
 
 	today := time.Now().Format("2006-01-02")
 
-	// If date has changed, this is the first save after midnight
-	// The passed values are accumulated stats from the old day that need to be preserved
 	if cfg.DailyDate != today {
-		// Log the final stats from the previous day before resetting
-		logger.Infof("[DailyStats] Day changed from %s to %s, final stats: requests=%d, tokens=%d", 
-			cfg.DailyDate, today, dailyReq, dailyTokens)
-		
-		// Reset to 0 for the new day (discard old day's in-memory accumulation)
-		cfg.DailyRequests = 0
-		cfg.DailyTokens = 0
+		logger.Infof("[DailyStats] Day changed from %s to %s, writing new-day stats: requests=%d success=%d failed=%d tokens=%d",
+			cfg.DailyDate, today, dailyReq, dailySuccess, dailyFailed, dailyTokens)
 		cfg.DailyDate = today
-		return Save()
 	}
 
-	// Same day: update with current values
 	cfg.DailyRequests = dailyReq
+	cfg.DailySuccessRequests = dailySuccess
+	cfg.DailyFailedRequests = dailyFailed
 	cfg.DailyTokens = dailyTokens
 	return Save()
 }
 
-// GetDailyStats returns daily statistics (requests, tokens, date)
-func GetDailyStats() (int, int, string) {
+// GetDailyStats returns daily statistics (requests, success, failed, tokens, date).
+// If the stored date is not today, returns zeros with today's date so callers
+// initialize memory for a fresh day without carrying over yesterday's totals.
+func GetDailyStats() (int, int, int, int, string) {
 	cfgLock.RLock()
 	defer cfgLock.RUnlock()
 
 	today := time.Now().Format("2006-01-02")
 
-	// If date doesn't match, return zero stats
 	if cfg.DailyDate != today {
-		return 0, 0, today
+		return 0, 0, 0, 0, today
 	}
 
-	return cfg.DailyRequests, cfg.DailyTokens, cfg.DailyDate
+	return cfg.DailyRequests, cfg.DailySuccessRequests, cfg.DailyFailedRequests, cfg.DailyTokens, cfg.DailyDate
 }
 
 // ResetDailyStatsIfNeeded checks and resets daily stats at midnight
@@ -660,6 +659,8 @@ func ResetDailyStatsIfNeeded() error {
 
 	if cfg.DailyDate != today {
 		cfg.DailyRequests = 0
+		cfg.DailySuccessRequests = 0
+		cfg.DailyFailedRequests = 0
 		cfg.DailyTokens = 0
 		cfg.DailyDate = today
 		return Save()
@@ -684,7 +685,9 @@ func UpdateAccountStats(id string, requestCount, errorCount, totalTokens int, to
 	return nil
 }
 
-// UpdateAccountDailyStats updates daily statistics for an account with automatic reset on date change
+// UpdateAccountDailyStats updates daily statistics for an account with automatic reset on date change.
+// The pool already rolls per-account counters before calling this; on date change
+// we must persist the caller's new-day values (typically 1), not force zero.
 func UpdateAccountDailyStats(id string, dailyReq, dailyTokens int) error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
@@ -693,20 +696,11 @@ func UpdateAccountDailyStats(id string, dailyReq, dailyTokens int) error {
 
 	for i, a := range cfg.Accounts {
 		if a.ID == id {
-			// If date has changed, this is the first save after midnight
 			if cfg.Accounts[i].DailyDate != today {
-				// Log the final stats from the previous day before resetting
-				logger.Infof("[DailyStats] Account %s day changed from %s to %s, final stats: requests=%d, tokens=%d", 
+				logger.Infof("[DailyStats] Account %s day changed from %s to %s, writing new-day stats: requests=%d, tokens=%d",
 					a.Email, cfg.Accounts[i].DailyDate, today, dailyReq, dailyTokens)
-				
-				// Reset to 0 for the new day
-				cfg.Accounts[i].DailyRequests = 0
-				cfg.Accounts[i].DailyTokens = 0
 				cfg.Accounts[i].DailyDate = today
-				return Save()
 			}
-
-			// Same day: update with current values
 			cfg.Accounts[i].DailyRequests = dailyReq
 			cfg.Accounts[i].DailyTokens = dailyTokens
 			return Save()

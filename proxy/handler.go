@@ -49,8 +49,12 @@ type Handler struct {
 	stopRefresh     chan struct{}
 	stopStatsSaver  chan struct{}
 	// 每日统计 (使用原子操作)
-	dailyRequests int64
-	dailyTokens   int64
+	dailyRequests        int64
+	dailySuccessRequests int64
+	dailyFailedRequests  int64
+	dailyTokens          int64
+	dailyDate            string // YYYY-MM-DD，与 daily* 计数对应
+	dailyMu              sync.Mutex
 	// 模型缓存
 	cachedModels    []ModelInfo
 	modelsCacheMu   sync.RWMutex
@@ -236,26 +240,31 @@ func NewHandler() *Handler {
 	applyProxyConfig(config.GetProxyURL())
 
 	totalReq, successReq, failedReq, totalTokens, totalCredits := config.GetStats()
-	dailyReq, dailyTokens, _ := config.GetDailyStats()
+	dailyReq, dailySuccess, dailyFailed, dailyTokens, dailyDate := config.GetDailyStats()
 	h := &Handler{
-		pool:            pool.GetPool(),
-		totalRequests:   int64(totalReq),
-		successRequests: int64(successReq),
-		failedRequests:  int64(failedReq),
-		totalTokens:     int64(totalTokens),
-		totalCredits:    totalCredits,
-		dailyRequests:   int64(dailyReq),
-		dailyTokens:     int64(dailyTokens),
+		pool:                 pool.GetPool(),
+		totalRequests:        int64(totalReq),
+		successRequests:      int64(successReq),
+		failedRequests:       int64(failedReq),
+		totalTokens:          int64(totalTokens),
+		totalCredits:         totalCredits,
+		dailyRequests:        int64(dailyReq),
+		dailySuccessRequests: int64(dailySuccess),
+		dailyFailedRequests:  int64(dailyFailed),
+		dailyTokens:          int64(dailyTokens),
+		dailyDate:            dailyDate,
 		startTime:       time.Now().Unix(),
 		stopRefresh:     make(chan struct{}),
 		stopStatsSaver:  make(chan struct{}),
 		promptCache:     newPromptCacheTracker(defaultPromptCacheTTL),
 	}
+	// 启动时对齐跨日：若磁盘日期已是今天但内存基数来自旧日，ensure 会在后续请求中滚动
+	h.ensureDailyCounters()
 	// 启动后台刷新
 	go h.backgroundRefresh()
 	// 启动后台统计保存 (每30秒保存一次)
 	go h.backgroundStatsSaver()
-	// 启动后台每日重置检查 (每小时检查一次)
+	// 启动后台每日重置检查
 	go h.backgroundDailyReset()
 	// 清理过期的 stored responses（>30 天）
 	go purgeExpiredResponses(responsesDefaultTTL)
@@ -453,6 +462,7 @@ func (h *Handler) handleHealth(w http.ResponseWriter, r *http.Request) {
 // handleStats 统计数据（需要 API Key 鉴权）
 func (h *Handler) handleStats(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	h.ensureDailyCounters()
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"status":          "ok",
 		"version":         config.Version,
@@ -463,10 +473,12 @@ func (h *Handler) handleStats(w http.ResponseWriter, r *http.Request) {
 		"failedRequests":  atomic.LoadInt64(&h.failedRequests),
 		"totalTokens":     atomic.LoadInt64(&h.totalTokens),
 		"totalCredits":    h.getCredits(),
-		"dailyRequests":   atomic.LoadInt64(&h.dailyRequests),
-		"dailyTokens":     atomic.LoadInt64(&h.dailyTokens),
-		"dailyDate":       time.Now().Format("2006-01-02"),
-		"uptime":          time.Now().Unix() - h.startTime,
+		"dailyRequests":        atomic.LoadInt64(&h.dailyRequests),
+		"dailySuccessRequests": atomic.LoadInt64(&h.dailySuccessRequests),
+		"dailyFailedRequests":  atomic.LoadInt64(&h.dailyFailedRequests),
+		"dailyTokens":          atomic.LoadInt64(&h.dailyTokens),
+		"dailyDate":            time.Now().Format("2006-01-02"),
+		"uptime":               time.Now().Unix() - h.startTime,
 	})
 }
 
@@ -1320,6 +1332,52 @@ func (h *Handler) backgroundStatsSaver() {
 	}
 }
 
+// ensureDailyCounters 在自然日切换时滚动内存中的每日计数。
+// 跨日时旧值属于前一天，应清零后再累计今天；不依赖 5 分钟定时器。
+func (h *Handler) ensureDailyCounters() {
+	h.dailyMu.Lock()
+	defer h.dailyMu.Unlock()
+	h.rollDailyCountersLocked(time.Now().Format("2006-01-02"))
+}
+
+// rollDailyCountersLocked 必须在持有 dailyMu 时调用。
+func (h *Handler) rollDailyCountersLocked(today string) {
+	if h.dailyDate == today {
+		return
+	}
+	prevDate := h.dailyDate
+	prevReq := atomic.LoadInt64(&h.dailyRequests)
+	prevSuccess := atomic.LoadInt64(&h.dailySuccessRequests)
+	prevFailed := atomic.LoadInt64(&h.dailyFailedRequests)
+	prevTok := atomic.LoadInt64(&h.dailyTokens)
+	atomic.StoreInt64(&h.dailyRequests, 0)
+	atomic.StoreInt64(&h.dailySuccessRequests, 0)
+	atomic.StoreInt64(&h.dailyFailedRequests, 0)
+	atomic.StoreInt64(&h.dailyTokens, 0)
+	h.dailyDate = today
+	if prevDate != "" {
+		logger.Infof("[DailyStats] memory day rolled from %s to %s, discarded in-memory totals: requests=%d success=%d failed=%d tokens=%d",
+			prevDate, today, prevReq, prevSuccess, prevFailed, prevTok)
+	}
+}
+
+// bumpDailyStats 按自然日滚动后累加今日请求/成功/失败/Token，与 ensure 共用一把锁避免跨日丢计数。
+// success=true 计成功，false 计失败。
+func (h *Handler) bumpDailyStats(success bool, tokens int64) {
+	h.dailyMu.Lock()
+	defer h.dailyMu.Unlock()
+	h.rollDailyCountersLocked(time.Now().Format("2006-01-02"))
+	atomic.AddInt64(&h.dailyRequests, 1)
+	if success {
+		atomic.AddInt64(&h.dailySuccessRequests, 1)
+	} else {
+		atomic.AddInt64(&h.dailyFailedRequests, 1)
+	}
+	if tokens != 0 {
+		atomic.AddInt64(&h.dailyTokens, tokens)
+	}
+}
+
 // saveStats 保存统计到配置文件
 func (h *Handler) saveStats() {
 	config.UpdateStats(
@@ -1329,33 +1387,32 @@ func (h *Handler) saveStats() {
 		int(atomic.LoadInt64(&h.totalTokens)),
 		h.getCredits(),
 	)
-	// 保存每日统计 - 无论日期是否匹配都要保存
-	// 如果日期不匹配，UpdateDailyStats 会处理跨日期的情况
+	// 跨日时先滚动内存计数，再把「当日」值写入配置
+	h.ensureDailyCounters()
 	config.UpdateDailyStats(
 		int(atomic.LoadInt64(&h.dailyRequests)),
+		int(atomic.LoadInt64(&h.dailySuccessRequests)),
+		int(atomic.LoadInt64(&h.dailyFailedRequests)),
 		int(atomic.LoadInt64(&h.dailyTokens)),
 	)
 }
 
-// backgroundDailyReset 后台定期检查并重置每日统计
+// backgroundDailyReset 后台定期滚动并落盘每日统计
 func (h *Handler) backgroundDailyReset() {
-	ticker := time.NewTicker(5 * time.Minute) // 每5分钟检查一次，更及时
+	ticker := time.NewTicker(5 * time.Minute)
 	defer ticker.Stop()
 
 	for {
 		select {
 		case <-ticker.C:
-			// 检查日期是否变化，如果变了就重置
-			dailyReq, dailyTokens, savedDate := config.GetDailyStats()
-			today := time.Now().Format("2006-01-02")
-
-			if savedDate != today {
-				// 重置内存中的计数器
-				atomic.StoreInt64(&h.dailyRequests, 0)
-				atomic.StoreInt64(&h.dailyTokens, 0)
-				// 重置配置文件中的统计
-				config.ResetDailyStatsIfNeeded()
-				logger.Infof("[DailyReset] Daily stats reset: previous date=%s, requests=%d, tokens=%d", savedDate, dailyReq, dailyTokens)
+			// 滚动内存 + 落盘；跨日时 ensureDailyCounters 会清零并记录日志
+			h.ensureDailyCounters()
+			req := int(atomic.LoadInt64(&h.dailyRequests))
+			succ := int(atomic.LoadInt64(&h.dailySuccessRequests))
+			fail := int(atomic.LoadInt64(&h.dailyFailedRequests))
+			tok := int(atomic.LoadInt64(&h.dailyTokens))
+			if err := config.UpdateDailyStats(req, succ, fail, tok); err != nil {
+				logger.Warnf("[DailyReset] failed to persist daily stats: %v", err)
 			}
 		case <-h.stopRefresh:
 			return
@@ -1383,9 +1440,8 @@ func (h *Handler) recordSuccess(inputTokens, outputTokens int, credits float64) 
 	atomic.AddInt64(&h.successRequests, 1)
 	atomic.AddInt64(&h.totalTokens, int64(inputTokens+outputTokens))
 	h.addCredits(credits)
-	// 增加每日统计
-	atomic.AddInt64(&h.dailyRequests, 1)
-	atomic.AddInt64(&h.dailyTokens, int64(inputTokens+outputTokens))
+	// 增加每日统计（先按自然日滚动）
+	h.bumpDailyStats(true, int64(inputTokens+outputTokens))
 }
 
 // recordSuccessForApiKey is recordSuccess + per-API-key usage attribution.
@@ -1405,8 +1461,8 @@ func (h *Handler) recordSuccessForApiKey(apiKeyID string, inputTokens, outputTok
 func (h *Handler) recordFailureWithDetails(endpoint, model, accountID string, err error) {
 	atomic.AddInt64(&h.totalRequests, 1)
 	atomic.AddInt64(&h.failedRequests, 1)
-	// 增加每日统计
-	atomic.AddInt64(&h.dailyRequests, 1)
+	// 增加每日统计（先按自然日滚动）
+	h.bumpDailyStats(false, 0)
 
 	if err == nil {
 		return
@@ -2331,12 +2387,23 @@ func (h *Handler) apiGetAccounts(w http.ResponseWriter, r *http.Request) {
 	// 隐藏敏感信息
 	result := make([]map[string]interface{}, len(accounts))
 	now := time.Now().Unix()
+	today := time.Now().Format("2006-01-02")
 	for i, a := range accounts {
-		// 获取运行时统计
-		stats := statsMap[a.ID]
+		// 获取运行时统计；不在池中时回退到配置文件中的统计
+		stats, inPool := statsMap[a.ID]
+		if !inPool {
+			stats = a
+		}
 
 		// 判断账号是否活跃（最近30秒内使用过）
 		isActive := stats.LastUsed > 0 && (now-stats.LastUsed) <= 30
+
+		// 每日统计仅返回「今天」的值，避免前端把昨日计数显示成今日
+		dailyRequests, dailyTokens, dailyDate := stats.DailyRequests, stats.DailyTokens, stats.DailyDate
+		if dailyDate != today {
+			dailyRequests, dailyTokens = 0, 0
+			dailyDate = today
+		}
 
 		result[i] = map[string]interface{}{
 			"id":                a.ID,
@@ -2380,9 +2447,9 @@ func (h *Handler) apiGetAccounts(w http.ResponseWriter, r *http.Request) {
 			"totalCredits":      stats.TotalCredits,
 			"lastUsed":          stats.LastUsed,
 			"isActive":          isActive,
-			"dailyRequests":     stats.DailyRequests,
-			"dailyTokens":       stats.DailyTokens,
-			"dailyDate":         stats.DailyDate,
+			"dailyRequests":     dailyRequests,
+			"dailyTokens":       dailyTokens,
+			"dailyDate":         dailyDate,
 		}
 	}
 	json.NewEncoder(w).Encode(result)
@@ -3065,6 +3132,7 @@ func (h *Handler) apiImportCredentials(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) apiGetStatus(w http.ResponseWriter, r *http.Request) {
+	h.ensureDailyCounters()
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"version":         config.Version,
 		"accounts":        h.pool.Count(),
@@ -3074,10 +3142,12 @@ func (h *Handler) apiGetStatus(w http.ResponseWriter, r *http.Request) {
 		"failedRequests":  atomic.LoadInt64(&h.failedRequests),
 		"totalTokens":     atomic.LoadInt64(&h.totalTokens),
 		"totalCredits":    h.getCredits(),
-		"dailyRequests":   atomic.LoadInt64(&h.dailyRequests),
-		"dailyTokens":     atomic.LoadInt64(&h.dailyTokens),
-		"dailyDate":       time.Now().Format("2006-01-02"),
-		"uptime":          time.Now().Unix() - h.startTime,
+		"dailyRequests":        atomic.LoadInt64(&h.dailyRequests),
+		"dailySuccessRequests": atomic.LoadInt64(&h.dailySuccessRequests),
+		"dailyFailedRequests":  atomic.LoadInt64(&h.dailyFailedRequests),
+		"dailyTokens":          atomic.LoadInt64(&h.dailyTokens),
+		"dailyDate":            time.Now().Format("2006-01-02"),
+		"uptime":               time.Now().Unix() - h.startTime,
 	})
 }
 
@@ -3190,6 +3260,7 @@ func (h *Handler) apiGetStats(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) apiResetStats(w http.ResponseWriter, r *http.Request) {
+	// 累计统计
 	atomic.StoreInt64(&h.totalRequests, 0)
 	atomic.StoreInt64(&h.successRequests, 0)
 	atomic.StoreInt64(&h.failedRequests, 0)
@@ -3197,7 +3268,26 @@ func (h *Handler) apiResetStats(w http.ResponseWriter, r *http.Request) {
 	h.creditsMu.Lock()
 	h.totalCredits = 0
 	h.creditsMu.Unlock()
-	config.UpdateStats(0, 0, 0, 0, 0)
+
+	// 今日统计（内存 + 落盘）
+	h.dailyMu.Lock()
+	atomic.StoreInt64(&h.dailyRequests, 0)
+	atomic.StoreInt64(&h.dailySuccessRequests, 0)
+	atomic.StoreInt64(&h.dailyFailedRequests, 0)
+	atomic.StoreInt64(&h.dailyTokens, 0)
+	h.dailyDate = time.Now().Format("2006-01-02")
+	h.dailyMu.Unlock()
+
+	if err := config.UpdateStats(0, 0, 0, 0, 0); err != nil {
+		w.WriteHeader(500)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+	if err := config.UpdateDailyStats(0, 0, 0, 0); err != nil {
+		w.WriteHeader(500)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
 	json.NewEncoder(w).Encode(map[string]bool{"success": true})
 }
 
