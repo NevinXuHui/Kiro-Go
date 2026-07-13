@@ -16,7 +16,13 @@
   let accountsData = [];
   const selectedAccounts = new Set();
   let filterKeyword = '';
-  let filterStatus = 'all';
+  const FILTER_STATUS_KEY = 'kiro_filter_status';
+  const FILTER_STATUS_VALUES = new Set(['all', 'enabled', 'disabled', 'exhausted', 'banned']);
+  function loadSavedFilterStatus() {
+    const saved = localStorage.getItem(FILTER_STATUS_KEY) || 'all';
+    return FILTER_STATUS_VALUES.has(saved) ? saved : 'all';
+  }
+  let filterStatus = loadSavedFilterStatus();
   let currentPage = 1;
   let pageSize = 20;
   let showExhaustedAccounts = true;
@@ -108,6 +114,7 @@
     updateLangButtons();
     applyTheme(getThemePref());
     refreshCustomSelects();
+    applyFilterStatusToSelect();
   }
   async function setLang(lang) {
     currentLang = lang;
@@ -320,6 +327,8 @@
   function refreshCustomSelects(root) {
     enhanceCustomSelects(root);
     qsa('select.custom-select-native', root || document).forEach(renderCustomSelectOptions);
+    // 自定义下拉重建后，把状态筛选恢复为内存/localStorage 中的值
+    applyFilterStatusToSelect();
   }
   function positionOpenCustomSelects() {
     qsa('select.custom-select-native').forEach(placeCustomSelectContent);
@@ -666,6 +675,10 @@
     $('statTokens').textContent = formatNum(d.totalTokens || 0);
     $('statDailyRequests').textContent = d.dailyRequests || 0;
     $('statDailyTokens').textContent = formatNum(d.dailyTokens || 0);
+    const dailySuccessEl = $('statDailySuccess');
+    if (dailySuccessEl) dailySuccessEl.textContent = d.dailySuccessRequests || 0;
+    const dailyFailedEl = $('statDailyFailed');
+    if (dailyFailedEl) dailyFailedEl.textContent = d.dailyFailedRequests || 0;
   }
 
   // ===== Logs =====
@@ -785,6 +798,8 @@
     const res = await api('/accounts');
     accountsData = await res.json();
     updateAccountStats();
+    // 刷新列表时保持用户选择的状态筛选，不要回到「全部」
+    applyFilterStatusToSelect();
     renderAccounts();
   }
 
@@ -838,10 +853,28 @@
       return true;
     });
   }
+  function applyFilterStatusToSelect() {
+    const sel = $('filterStatusSelect');
+    if (!sel) return;
+    if (!FILTER_STATUS_VALUES.has(filterStatus)) filterStatus = 'all';
+    if (sel.value !== filterStatus) sel.value = filterStatus;
+    if (typeof syncCustomSelect === 'function') syncCustomSelect(sel);
+  }
+  function setFilterStatus(status, { resetPage = true } = {}) {
+    filterStatus = FILTER_STATUS_VALUES.has(status) ? status : 'all';
+    try { localStorage.setItem(FILTER_STATUS_KEY, filterStatus); } catch (_) {}
+    applyFilterStatusToSelect();
+    if (resetPage) currentPage = 1;
+    renderAccounts();
+  }
   function onFilterChange() {
     filterKeyword = $('filterSearch').value;
-    filterStatus = $('filterStatusSelect').value;
-    currentPage = 1;
+    const next = $('filterStatusSelect').value;
+    if (next !== filterStatus) {
+      filterStatus = FILTER_STATUS_VALUES.has(next) ? next : 'all';
+      try { localStorage.setItem(FILTER_STATUS_KEY, filterStatus); } catch (_) {}
+      currentPage = 1;
+    }
     renderAccounts();
   }
   function toggleSelectAll(checked) {
@@ -3499,6 +3532,8 @@
     html += statsCard(t('api.statsTotalReqs'), formatNum(d.totalRequests || 0), 'info');
     html += statsCard(t('api.statsSuccessReqs'), formatNum(d.successRequests || 0), 'success');
     html += statsCard(t('api.statsFailedReqs'), formatNum(d.failedRequests || 0), 'danger');
+    html += statsCard(t('api.statsDailySuccess'), formatNum(d.dailySuccessRequests || 0), 'success');
+    html += statsCard(t('api.statsDailyFailed'), formatNum(d.dailyFailedRequests || 0), 'danger');
     html += statsCard(t('api.statsTotalTokens'), formatNum(d.totalTokens || 0), '');
     html += statsCard(t('api.statsTotalCredits'), (d.totalCredits || 0).toFixed(2), 'info');
     html += '</div>';
@@ -3536,6 +3571,7 @@
     const yr = $('footerYear');
     if (yr) yr.textContent = new Date().getFullYear();
     wireEvents();
+    applyFilterStatusToSelect();
     if (password) tryAutoLogin();
     setInterval(() => {
       if (!$('mainPage').classList.contains('hidden')) loadStats();

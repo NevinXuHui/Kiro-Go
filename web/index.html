@@ -185,6 +185,13 @@
             <div class="stat-main">
               <div class="stat-value" id="statSuccess">0</div>
               <div class="stat-sub"><span class="stat-label" data-i18n="stats.completed"></span></div>
+              <div class="stat-sub stat-sub--daily">
+                <span class="stat-sub-sec">
+                  <i class="fa-solid fa-calendar-day stat-daily-icon"></i>
+                  <span class="stat-value-sm stat-value-primary" id="statDailySuccess">0</span>
+                  <span class="stat-label" data-i18n="stats.dailySuccess"></span>
+                </span>
+              </div>
             </div>
             <i class="fa-solid fa-circle-check stat-icon" aria-hidden="true"></i>
           </div>
@@ -196,6 +203,13 @@
               <div class="stat-value stat-value--danger" id="statFailed">0</div>
               <div class="stat-sub">
                 <span class="stat-label" data-i18n="stats.errors"></span>
+              </div>
+              <div class="stat-sub stat-sub--daily">
+                <span class="stat-sub-sec">
+                  <i class="fa-solid fa-calendar-day stat-daily-icon"></i>
+                  <span class="stat-value-sm stat-value-danger" id="statDailyFailed">0</span>
+                  <span class="stat-label" data-i18n="stats.dailyFailed"></span>
+                </span>
               </div>
             </div>
             <i class="fa-solid fa-circle-xmark stat-icon stat-icon--danger" aria-hidden="true"></i>
