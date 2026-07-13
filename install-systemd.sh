@@ -27,16 +27,21 @@ if [ "$EUID" -ne 0 ]; then
     exit 1
 fi
 
-# 检查可执行文件是否存在
-if [ ! -f "$SCRIPT_DIR/kiro-go" ]; then
-    echo "警告: 找不到 kiro-go 可执行文件"
-    echo "请先运行 'go build -o kiro-go' 编译项目"
-    read -p "是否继续安装服务? (y/N) " -n 1 -r
-    echo
-    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-        exit 1
-    fi
+# 先编译，再安装（与 SYSTEMD_DEPLOY 文档一致）
+echo "→ 编译项目..."
+if ! command -v go >/dev/null 2>&1; then
+    echo "错误: 未找到 go 命令，无法编译"
+    exit 1
 fi
+(
+    cd "$SCRIPT_DIR"
+    go build -o kiro-go .
+)
+if [ ! -x "$SCRIPT_DIR/kiro-go" ]; then
+    echo "错误: 编译失败，未生成可执行文件 $SCRIPT_DIR/kiro-go"
+    exit 1
+fi
+echo "  ✓ 已生成 $SCRIPT_DIR/kiro-go"
 
 # 停止现有服务（如果存在）
 if systemctl is-active --quiet $SERVICE_NAME; then

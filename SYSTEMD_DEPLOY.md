@@ -2,23 +2,22 @@
 
 ## 快速部署
 
-### 1. 编译项目
+### 1. 一键编译并安装 systemd 服务
 ```bash
 cd /root/Kiro-Go
-go build -o kiro-go
-```
-
-### 2. 安装 systemd 服务
-```bash
 sudo bash install-systemd.sh
 ```
 
 安装脚本会自动：
+- 在项目目录执行 `go build -o kiro-go .`
 - 停止现有服务（如果存在）
 - 将服务文件复制到 `/etc/systemd/system/`
 - 启用服务（开机自启动）
 - 启动服务
 - 显示服务状态
+
+> 说明：`install-systemd.sh` 按 `kiro-go.service` 使用仓库路径（默认 `/root/Kiro-Go`）。
+> 若生产部署在 `/opt/kiro-go`，请用 `sudo bash install-service.sh`（脚本内也会先编译再安装）。
 
 ### 3. 验证服务状态
 ```bash

@@ -22,12 +22,21 @@ if [[ $EUID -ne 0 ]]; then
    exit 1
 fi
 
-# 检查二进制文件
-if [[ ! -f "$CURRENT_DIR/kiro-go" ]]; then
-    echo "错误: 未找到 kiro-go 可执行文件"
-    echo "请先运行 'go build -o kiro-go' 编译项目"
+# 先编译，再安装
+echo "→ 编译项目..."
+if ! command -v go >/dev/null 2>&1; then
+    echo "错误: 未找到 go 命令，无法编译"
     exit 1
 fi
+(
+    cd "$CURRENT_DIR"
+    go build -o kiro-go .
+)
+if [[ ! -x "$CURRENT_DIR/kiro-go" ]]; then
+    echo "错误: 编译失败，未生成可执行文件 $CURRENT_DIR/kiro-go"
+    exit 1
+fi
+echo "  ✓ 已生成 $CURRENT_DIR/kiro-go"
 
 echo "→ 安装路径: $INSTALL_DIR"
 echo ""
