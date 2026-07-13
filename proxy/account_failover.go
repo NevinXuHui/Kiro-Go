@@ -19,6 +19,23 @@ func isOverageErrorMessage(msg string) bool {
 	return strings.Contains(msg, "402") && strings.Contains(msg, "overage")
 }
 
+// isMonthlyQuotaErrorMessage detects free-tier / monthly request count exhaustion
+// (e.g. HTTP 402 ... "You have reached the limit." reason MONTHLY_REQUEST_COUNT).
+func isMonthlyQuotaErrorMessage(msg string) bool {
+	msg = strings.ToLower(msg)
+	if strings.Contains(msg, "monthly_request_count") {
+		return true
+	}
+	if strings.Contains(msg, "reached the limit") {
+		return true
+	}
+	// 402 with limit wording but not necessarily "overage"
+	if strings.Contains(msg, "402") && strings.Contains(msg, "limit") && !strings.Contains(msg, "overage") {
+		return true
+	}
+	return false
+}
+
 func isSuspensionErrorMessage(msg string) bool {
 	msg = strings.ToLower(msg)
 	return strings.Contains(msg, "temporarily_suspended") ||
@@ -43,6 +60,30 @@ func isAuthErrorMessage(msg string) bool {
 		strings.Contains(msg, "invalid_grant") ||
 		strings.Contains(msg, "access token expired") ||
 		strings.Contains(msg, "refresh token expired")
+}
+
+func (h *Handler) markAccountQuotaExhausted(account *config.Account) {
+	if account == nil {
+		return
+	}
+	if err := config.MarkAccountUsageExhausted(account.ID); err != nil {
+		logger.Warnf("[AccountFailover] Failed to mark %s exhausted: %v", account.Email, err)
+		return
+	}
+	// Keep local snapshot consistent for callers still holding the pointer.
+	if account.UsageLimit > 0 {
+		if account.UsageCurrent < account.UsageLimit {
+			account.UsageCurrent = account.UsageLimit
+		}
+	} else if account.UsageCurrent > 0 {
+		account.UsageLimit = account.UsageCurrent
+	} else {
+		account.UsageLimit = 1
+		account.UsageCurrent = 1
+	}
+	account.UsagePercent = 1
+	logger.Infof("[AccountFailover] Marked %s as quota exhausted (usage %.1f/%.1f)", account.Email, account.UsageCurrent, account.UsageLimit)
+	h.pool.Reload()
 }
 
 func (h *Handler) disableAccount(account *config.Account, banStatus, banReason string) {
@@ -98,6 +139,9 @@ func (h *Handler) handleAccountFailure(account *config.Account, err error) {
 	case isOverageErrorMessage(errMsg):
 		h.disableAccountOverage(account)
 		h.pool.RecordError(account.ID, false)
+	case isMonthlyQuotaErrorMessage(errMsg):
+		h.markAccountQuotaExhausted(account)
+		h.pool.MarkOverLimit(account.ID)
 	case isQuotaErrorMessage(errMsg):
 		h.pool.RecordError(account.ID, true)
 	case isSuspensionErrorMessage(errMsg):

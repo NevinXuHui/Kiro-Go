@@ -24,15 +24,20 @@
   }
   let filterStatus = loadSavedFilterStatus();
   const SORT_BY_KEY = 'kiro_sort_by';
-  const SORT_BY_VALUES = new Set(['default', 'usage_desc', 'usage_asc', 'usage_current_desc', 'usage_current_asc']);
+  const SORT_BY_VALUES = new Set(['default', 'usage_desc', 'usage_asc']);
   function loadSavedSortBy() {
-    const saved = localStorage.getItem(SORT_BY_KEY) || 'default';
+    let saved = localStorage.getItem(SORT_BY_KEY) || 'default';
+    // 兼容旧版「已用量」选项，映射为使用量百分比排序
+    if (saved === 'usage_current_desc') saved = 'usage_desc';
+    if (saved === 'usage_current_asc') saved = 'usage_asc';
     return SORT_BY_VALUES.has(saved) ? saved : 'default';
   }
   let sortBy = loadSavedSortBy();
   let currentPage = 1;
   let pageSize = 20;
   let showExhaustedAccounts = true;
+  let batchTestConcurrency = 5;
+  let importConcurrency = 100;
   let privacyModeEnabled = true;
   let promptRules = [];
   let builderIdSession = '';
@@ -682,8 +687,12 @@
     $('statSuccess').textContent = d.successRequests || 0;
     $('statFailed').textContent = d.failedRequests || 0;
     $('statTokens').textContent = formatNum(d.totalTokens || 0);
+    const creditsEl = $('statCredits');
+    if (creditsEl) creditsEl.textContent = (d.totalCredits || 0).toFixed(2);
     $('statDailyRequests').textContent = d.dailyRequests || 0;
     $('statDailyTokens').textContent = formatNum(d.dailyTokens || 0);
+    const dailyCreditsEl = $('statDailyCredits');
+    if (dailyCreditsEl) dailyCreditsEl.textContent = (d.dailyCredits || 0).toFixed(2);
     const dailySuccessEl = $('statDailySuccess');
     if (dailySuccessEl) dailySuccessEl.textContent = d.dailySuccessRequests || 0;
     const dailyFailedEl = $('statDailyFailed');
@@ -843,32 +852,21 @@
       return Number(a.usagePercent);
     }
     if (a.usageLimit > 0) return Number(a.usageCurrent || 0) / Number(a.usageLimit);
-    return -1; // 无配额的账号排到对应端
-  }
-  function getAccountUsageCurrent(a) {
-    return Number(a.usageCurrent || 0);
+    return -1; // 无配额的账号排到后面
   }
   function sortAccounts(list) {
     if (!sortBy || sortBy === 'default') return list;
     const arr = list.slice();
     const cmpNum = (x, y) => (x === y ? 0 : (x < y ? -1 : 1));
     arr.sort((a, b) => {
-      let av, bv;
-      if (sortBy === 'usage_desc' || sortBy === 'usage_asc') {
-        av = getAccountUsagePercent(a);
-        bv = getAccountUsagePercent(b);
-        // 无用量数据的账号始终靠后
-        if (av < 0 && bv < 0) return 0;
-        if (av < 0) return 1;
-        if (bv < 0) return -1;
-        return sortBy === 'usage_desc' ? cmpNum(bv, av) : cmpNum(av, bv);
-      }
-      if (sortBy === 'usage_current_desc' || sortBy === 'usage_current_asc') {
-        av = getAccountUsageCurrent(a);
-        bv = getAccountUsageCurrent(b);
-        return sortBy === 'usage_current_desc' ? cmpNum(bv, av) : cmpNum(av, bv);
-      }
-      return 0;
+      if (sortBy !== 'usage_desc' && sortBy !== 'usage_asc') return 0;
+      const av = getAccountUsagePercent(a);
+      const bv = getAccountUsagePercent(b);
+      // 无用量数据的账号始终靠后
+      if (av < 0 && bv < 0) return 0;
+      if (av < 0) return 1;
+      if (bv < 0) return -1;
+      return sortBy === 'usage_desc' ? cmpNum(bv, av) : cmpNum(av, bv);
     });
     return arr;
   }
@@ -1217,6 +1215,7 @@
         '<div class="account-stat"><div class="account-stat-value account-stat-value--primary">' + (a.dailyRequests || 0) + '</div><div class="account-stat-label">' + escapeHtml(t('accounts.dailyRequests')) + '</div></div>' +
         '<div class="account-stat"><div class="account-stat-value account-stat-value--primary">' + formatNum(a.dailyTokens || 0) + '</div><div class="account-stat-label">' + escapeHtml(t('accounts.dailyTokens')) + '</div></div>' +
         '<div class="account-stat"><div class="account-stat-value">' + (a.totalCredits || 0).toFixed(1) + '</div><div class="account-stat-label">' + escapeHtml(t('accounts.credits')) + '</div></div>' +
+        '<div class="account-stat"><div class="account-stat-value account-stat-value--primary">' + (a.dailyCredits || 0).toFixed(1) + '</div><div class="account-stat-label">' + escapeHtml(t('accounts.dailyCredits')) + '</div></div>' +
         '<div class="account-stat"><div class="account-stat-value">' + escapeHtml(formatTokenExpiry(a.expiresAt)) + '</div><div class="account-stat-label">' + escapeHtml(t('accounts.expiry')) + '</div></div>' +
         '</div>' +
         '</div>';
@@ -1368,207 +1367,425 @@
     setTimeout(() => { btn.disabled = false; btn.className = cls; btn.innerHTML = html; }, 800);
   }
 
+
+  // 通用并发池：最多 concurrency 个任务同时执行
+  async function runWithConcurrency(items, concurrency, worker, onProgress) {
+    const total = items.length;
+    let nextIndex = 0;
+    let completed = 0;
+    const limit = Math.max(1, Math.min(concurrency || 1, total || 1));
+
+    async function runOne() {
+      while (true) {
+        const i = nextIndex++;
+        if (i >= total) return;
+        try {
+          await worker(items[i], i);
+        } finally {
+          completed++;
+          if (onProgress) onProgress(completed, total, i);
+        }
+      }
+    }
+
+    const runners = [];
+    for (let r = 0; r < limit; r++) runners.push(runOne());
+    await Promise.all(runners);
+  }
+
+  function ensureBatchProgressPanel() {
+    let panel = $('batchProgressPanel');
+    if (panel) return panel;
+    panel = document.createElement('div');
+    panel.id = 'batchProgressPanel';
+    panel.className = 'batch-progress-panel hidden';
+    panel.innerHTML =
+      '<div class="batch-progress-title" id="batchProgressTitle"></div>' +
+      '<div class="import-progress-container">' +
+      '<div class="import-progress-header">' +
+      '<span class="import-progress-status" id="batchProgressStatus"></span>' +
+      '<span class="import-progress-count" id="batchProgressCount"></span>' +
+      '</div>' +
+      '<div class="batch-progress-meta" id="batchProgressMeta"></div>' +
+      '<div class="import-progress-bar">' +
+      '<div class="import-progress-fill" id="batchProgressFill"></div>' +
+      '</div>' +
+      '<div class="import-progress-summary">' +
+      '<div class="import-progress-stat success" title="success"><i>✓</i><span id="batchProgressSuccess">0</span></div>' +
+      '<div class="import-progress-stat error" title="failed"><i>✗</i><span id="batchProgressFailed">0</span></div>' +
+      '<div class="import-progress-stat exhausted" title="exhausted"><i>⊘</i><span id="batchProgressExhausted">0</span></div>' +
+      '<div class="import-progress-stat pending" title="pending"><i>⋯</i><span id="batchProgressPending">0</span></div>' +
+      '</div>' +
+      '</div>';
+    document.body.appendChild(panel);
+    return panel;
+  }
+
+  function showBatchProgress({ title, status, completed, total, success, fail, exhausted, concurrency, showExhaustedStat }) {
+    const panel = ensureBatchProgressPanel();
+    panel.classList.remove('hidden');
+    const set = (id, val) => { const el = $(id); if (el) el.textContent = val == null ? '' : String(val); };
+
+    const done = Number(completed) || 0;
+    const all = Number(total) || 0;
+    // 主文案：正在处理第 current/total 个账号（current 取已完成数，更直观）
+    const mainStatus = status || t('batch.processingCurrent', done, all);
+
+    set('batchProgressTitle', title || '');
+    set('batchProgressStatus', mainStatus);
+    set('batchProgressCount', t('batch.progressCount', done, all));
+    set('batchProgressMeta', concurrency ? t('batch.progressConcurrency', concurrency) : '');
+    set('batchProgressSuccess', success || 0);
+    set('batchProgressFailed', fail || 0);
+    set('batchProgressExhausted', exhausted || 0);
+    set('batchProgressPending', Math.max(0, all - done));
+
+    const exhWrap = $('batchProgressExhausted') && $('batchProgressExhausted').parentElement;
+    if (exhWrap) exhWrap.style.display = showExhaustedStat ? '' : 'none';
+
+    const fill = $('batchProgressFill');
+    if (fill) {
+      const pct = all > 0 ? Math.max(0, Math.min(100, Math.round((done / all) * 100))) : 0;
+      fill.style.width = pct + '%';
+      fill.classList.toggle('with-errors', (Number(fail) || 0) + (Number(exhausted) || 0) > 0);
+    }
+  }
+
+  function hideBatchProgress(delayMs) {
+    const panel = $('batchProgressPanel');
+    if (!panel) return;
+    const hide = () => panel.classList.add('hidden');
+    if (delayMs && delayMs > 0) setTimeout(hide, delayMs);
+    else hide();
+  }
+
+  function markLocalAccountExhausted(id) {
+    const acc = accountsData.find(a => a.id === id);
+    if (!acc) return false;
+    const before = Number(acc.usageCurrent || 0);
+    const beforeLimit = Number(acc.usageLimit || 0);
+    if (acc.usageLimit > 0) acc.usageCurrent = Math.max(Number(acc.usageCurrent || 0), Number(acc.usageLimit));
+    else { acc.usageLimit = 1; acc.usageCurrent = 1; }
+    acc.usagePercent = 1;
+    // 已用完账号从当前选择中移除，避免继续选中
+    if (selectedAccounts.has(id)) selectedAccounts.delete(id);
+    return before !== Number(acc.usageCurrent || 0) || beforeLimit !== Number(acc.usageLimit || 0) || true;
+  }
+
+  function refreshAccountsUIRealtime() {
+    try {
+      updateAccountStats();
+      renderAccounts();
+      updateBatchBar();
+    } catch (_) {}
+  }
+
+  async function runBatchJobs({
+    ids,
+    title,
+    runningStatus,
+    doneTitle,
+    resultToast,
+    worker,
+    concurrency = 1,
+    showExhaustedStat = false,
+    onItemResult = null,
+  }) {
+    const total = ids.length;
+    if (!total) return { success: 0, fail: 0, exhausted: 0 };
+    const limit = Math.min(Math.max(1, concurrency || 1), total);
+    let success = 0, fail = 0, exhausted = 0;
+    let uiRefreshQueued = false;
+
+    const queueRealtimeUIRefresh = () => {
+      if (uiRefreshQueued) return;
+      uiRefreshQueued = true;
+      setTimeout(() => {
+        uiRefreshQueued = false;
+        refreshAccountsUIRealtime();
+      }, 120);
+    };
+
+    const paint = (completed, statusText) => {
+      showBatchProgress({
+        title,
+        status: statusText || t('batch.processingCurrent', completed, total),
+        completed,
+        total,
+        success,
+        fail,
+        exhausted: showExhaustedStat ? exhausted : 0,
+        concurrency: limit,
+        showExhaustedStat
+      });
+    };
+
+    paint(0, t('batch.processingCurrent', 0, total));
+    await runWithConcurrency(ids, limit, async (id) => {
+      try {
+        const result = await worker(id);
+        // result: 'success' | 'fail' | 'exhausted' | true/false
+        const code = result === true ? 'success'
+          : result === false ? 'fail'
+          : (result || 'fail');
+        if (code === 'success') success++;
+        else if (code === 'exhausted') {
+          exhausted++;
+          markLocalAccountExhausted(id);
+          queueRealtimeUIRefresh();
+        } else fail++;
+        if (onItemResult) onItemResult(id, code);
+      } catch {
+        fail++;
+      }
+    }, (done) => {
+      paint(done, t('batch.processingCurrent', done, total));
+    });
+
+    const finalStatus = typeof resultToast === 'function'
+      ? resultToast(success, fail, exhausted)
+      : (resultToast || t('batch.processingCurrent', total, total));
+    paint(total, finalStatus);
+    hideBatchProgress(1600);
+    return { success, fail, exhausted };
+  }
+
+  async function batchTestAccounts(ids) {
+    const concurrency = Math.min(Math.max(1, batchTestConcurrency || 5), ids.length);
+    const { success, fail, exhausted } = await runBatchJobs({
+      ids,
+      title: t('batch.test'),
+      runningStatus: t('batch.testingProgress'),
+      doneTitle: t('batch.testingDone'),
+      showExhaustedStat: true,
+      concurrency,
+      resultToast: (s, f, e) => t('batch.testResult', s, f, e),
+      worker: async (id) => {
+        const res = await api('/accounts/' + id + '/test', {
+          method: 'POST',
+          body: JSON.stringify({ model: 'claude-sonnet-4' })
+        });
+        const d = await res.json().catch(() => ({}));
+        if (d.success) return 'success';
+        if (d.exhausted) return 'exhausted';
+        return 'fail';
+      }
+    });
+    toast(t('batch.testResult', success, fail, exhausted), (fail || exhausted) ? 'warning' : 'success');
+    selectedAccounts.clear();
+    updateBatchBar();
+    await loadAccounts();
+    loadStats();
+  }
+
   // Batch actions
   async function batchAction(action) {
     const ids = Array.from(selectedAccounts);
     if (!ids.length) return;
-    const confirmKey = 'batch.confirm' + action.charAt(0).toUpperCase() + action.slice(1);
-    const ok = await confirmAction(t(confirmKey, ids.length), {
-      title: t('common.confirm'),
+
+    if (action === 'test') {
+      const ok = await confirmAction(t('batch.confirmTest', ids.length, batchTestConcurrency || 5), {
+        title: t('batch.test'),
+        confirmText: t('common.confirm'),
+        variant: 'primary'
+      });
+      if (!ok) return;
+      await batchTestAccounts(ids);
+      return;
+    }
+
+    const conc = Math.min(Math.max(1, batchTestConcurrency || 5), ids.length);
+    const meta = {
+      enable: {
+        title: t('batch.enable'),
+        running: t('batch.enabling'),
+        confirm: t('batch.confirmEnable', ids.length, conc),
+        result: (s, f) => t('batch.enableResult', s),
+        concurrency: conc,
+        worker: async (id) => {
+          const res = await api('/accounts/' + id, {
+            method: 'PUT',
+            body: JSON.stringify({ enabled: true })
+          });
+          const d = await res.json().catch(() => ({}));
+          return res.ok && d.success !== false ? 'success' : 'fail';
+        }
+      },
+      disable: {
+        title: t('batch.disable'),
+        running: t('batch.disabling'),
+        confirm: t('batch.confirmDisable', ids.length, conc),
+        result: (s, f) => t('batch.disableResult', s),
+        concurrency: conc,
+        worker: async (id) => {
+          const res = await api('/accounts/' + id, {
+            method: 'PUT',
+            body: JSON.stringify({ enabled: false })
+          });
+          const d = await res.json().catch(() => ({}));
+          return res.ok && d.success !== false ? 'success' : 'fail';
+        }
+      },
+      refresh: {
+        title: t('batch.refresh'),
+        running: t('batch.refreshing'),
+        confirm: t('batch.confirmRefresh', ids.length, conc),
+        result: (s, f) => t('batch.refreshResult', s, f),
+        concurrency: conc,
+        worker: async (id) => {
+          const res = await api('/accounts/' + id + '/refresh', { method: 'POST' });
+          const d = await res.json().catch(() => ({}));
+          return res.ok && d.success !== false ? 'success' : 'fail';
+        }
+      }
+    };
+
+    const cfg = meta[action];
+    if (!cfg) return;
+
+    const ok = await confirmAction(cfg.confirm, {
+      title: cfg.title,
       confirmText: t('common.confirm'),
       variant: action === 'disable' ? 'danger' : 'primary'
     });
     if (!ok) return;
-    
-    let toastId = null;
-    let success = 0, fail = 0;
-    const total = ids.length;
-    
-    // 获取进度提示文本
-    let progressTextKey = 'batch.processing';
-    if (action === 'enable') progressTextKey = 'batch.enabling';
-    else if (action === 'disable') progressTextKey = 'batch.disabling';
-    else if (action === 'refresh') progressTextKey = 'batch.refreshing';
-    
-    for (let i = 0; i < ids.length; i++) {
-      const id = ids[i];
-      const current = i + 1;
-      const progress = t('batch.progress', current, total);
-      
-      if (toastId) {
-        // 更新现有 toast
-        const el = document.querySelector(`[data-toast-id="${toastId}"]`);
-        if (el) {
-          const msg = el.querySelector('.toast-message');
-          if (msg) msg.textContent = `${t(progressTextKey)} - ${progress}`;
-        }
-      } else {
-        // 创建新 toast
-        toastId = Date.now().toString();
-        const el = document.createElement('div');
-        el.className = 'toast toast-info';
-        el.setAttribute('data-toast-id', toastId);
-        el.innerHTML = `<div class="toast-message">${escapeHtml(t(progressTextKey))} - ${progress}</div>`;
-        document.body.appendChild(el);
-        setTimeout(() => el.classList.add('toast-show'), 10);
-      }
-      
-      try {
-        let res;
-        if (action === 'refresh') {
-          // 刷新账号状态
-          res = await api('/accounts/' + id + '/refresh', { method: 'POST' });
-        } else if (action === 'enable' || action === 'disable') {
-          // 更新启用/禁用状态
-          res = await api('/accounts/' + id, { 
-            method: 'PUT', 
-            body: JSON.stringify({ enabled: action === 'enable' }) 
-          });
-        }
-        const d = await res.json().catch(() => ({}));
-        if (res.ok && d.success !== false) success++; else fail++;
-      } catch { fail++; }
-    }
-    
-    // 移除进度 toast
-    if (toastId) {
-      const el = document.querySelector(`[data-toast-id="${toastId}"]`);
-      if (el) {
-        el.classList.remove('toast-show');
-        setTimeout(() => el.remove(), 300);
-      }
-    }
-    
-    // 显示结果
-    if (action === 'refresh') {
-      toast(t('batch.refreshResult', success, fail), fail ? 'warning' : 'success');
-    } else if (action === 'enable') {
-      toast(t('batch.enableResult', success), fail ? 'warning' : 'success');
-    } else if (action === 'disable') {
-      toast(t('batch.disableResult', success), fail ? 'warning' : 'success');
-    } else {
-      toast(t('batch.done'), 'success');
-    }
-    
-    selectedAccounts.clear();
-    updateBatchBar();
-    loadAccounts(); loadStats();
-  }
-  async function batchRefreshModels() {
-    const ids = Array.from(selectedAccounts);
-    if (!ids.length) return;
-    const confirmed = await confirmAction(t('batch.confirmRefreshModels', ids.length), {
-      title: t('models.refreshAll'),
-      confirmText: t('common.confirm')
+
+    const { success, fail } = await runBatchJobs({
+      ids,
+      title: cfg.title,
+      runningStatus: cfg.running,
+      concurrency: cfg.concurrency,
+      resultToast: (s, f) => cfg.result(s, f),
+      worker: cfg.worker
     });
-    if (!confirmed) return;
-    
-    let toastId = null;
-    let ok = 0, fail = 0;
-    const total = ids.length;
-    
-    for (let i = 0; i < ids.length; i++) {
-      const id = ids[i];
-      const current = i + 1;
-      const progress = t('batch.progress', current, total);
-      
-      if (toastId) {
-        // 更新现有 toast
-        const el = document.querySelector(`[data-toast-id="${toastId}"]`);
-        if (el) {
-          const msg = el.querySelector('.toast-message');
-          if (msg) msg.textContent = `${t('detail.refreshModelCache')} - ${progress}`;
-        }
-      } else {
-        // 创建新 toast
-        toastId = Date.now().toString();
-        const el = document.createElement('div');
-        el.className = 'toast toast-info';
-        el.setAttribute('data-toast-id', toastId);
-        el.innerHTML = `<div class="toast-message">${escapeHtml(t('detail.refreshModelCache'))} - ${progress}</div>`;
-        document.body.appendChild(el);
-        setTimeout(() => el.classList.add('toast-show'), 10);
-      }
-      
-      try {
-        const res = await api('/accounts/' + id + '/models/refresh', { method: 'POST' });
-        const d = await res.json();
-        if (d.success) ok++; else fail++;
-      } catch { fail++; }
-    }
-    
-    // 移除进度 toast
-    if (toastId) {
-      const el = document.querySelector(`[data-toast-id="${toastId}"]`);
-      if (el) {
-        el.classList.remove('toast-show');
-        setTimeout(() => el.remove(), 300);
-      }
-    }
-    
-    toast(t('batch.refreshModelsResult', ok, fail), fail ? 'warning' : 'success');
+
+    const warn = fail > 0;
+    if (action === 'refresh') toast(t('batch.refreshResult', success, fail), warn ? 'warning' : 'success');
+    else if (action === 'enable') toast(t('batch.enableResult', success), warn ? 'warning' : 'success');
+    else if (action === 'disable') toast(t('batch.disableResult', success), warn ? 'warning' : 'success');
+    else toast(t('batch.done'), 'success');
+
     selectedAccounts.clear();
     updateBatchBar();
-    loadAccounts();
+    await loadAccounts();
+    loadStats();
   }
+
   async function batchDelete() {
     const ids = Array.from(selectedAccounts);
     if (!ids.length) return;
-    const confirmed = await confirmAction(t('batch.confirmDelete', ids.length), {
+    const delConc = Math.min(Math.max(1, batchTestConcurrency || 5), ids.length);
+    const confirmed = await confirmAction(t('batch.confirmDelete', ids.length, delConc), {
       title: t('accounts.delete'),
       confirmText: t('accounts.delete'),
       variant: 'danger'
     });
     if (!confirmed) return;
-    
-    let toastId = null;
-    let ok = 0, fail = 0;
+
+    // 根因：逐个 DELETE 每次都会全局锁 + 整份 config.json 重写，前端并发也会被串成单线程。
+    // 方案：按并发数分块，每块一次 /accounts/batch delete（一次锁、一次保存，删除 delConc 个）。
+    // 块与块串行推进进度，避免多请求抢同一把 cfgLock 互相空等。
     const total = ids.length;
-    
-    for (let i = 0; i < ids.length; i++) {
-      const id = ids[i];
-      const current = i + 1;
-      const progress = t('batch.progress', current, total);
-      
-      if (toastId) {
-        // 更新现有 toast
-        const el = document.querySelector(`[data-toast-id="${toastId}"]`);
-        if (el) {
-          const msg = el.querySelector('.toast-message');
-          if (msg) msg.textContent = `${t('batch.deleting')} - ${progress}`;
-        }
-      } else {
-        // 创建新 toast
-        toastId = Date.now().toString();
-        const el = document.createElement('div');
-        el.className = 'toast toast-info';
-        el.setAttribute('data-toast-id', toastId);
-        el.innerHTML = `<div class="toast-message">${escapeHtml(t('batch.deleting'))} - ${progress}</div>`;
-        document.body.appendChild(el);
-        setTimeout(() => el.classList.add('toast-show'), 10);
-      }
-      
+    const chunks = [];
+    for (let i = 0; i < ids.length; i += delConc) {
+      chunks.push(ids.slice(i, i + delConc));
+    }
+
+    let success = 0, fail = 0;
+    const title = t('batch.delete') || t('accounts.delete');
+    showBatchProgress({
+      title,
+      status: t('batch.processingCurrent', 0, total),
+      completed: 0,
+      total,
+      success: 0,
+      fail: 0,
+      exhausted: 0,
+      concurrency: delConc,
+      showExhaustedStat: false
+    });
+
+    for (let ci = 0; ci < chunks.length; ci++) {
+      const chunk = chunks[ci];
       try {
-        const res = await api('/accounts/' + id, { method: 'DELETE' });
+        const res = await api('/accounts/batch', {
+          method: 'POST',
+          body: JSON.stringify({ ids: chunk, action: 'delete' })
+        });
         const d = await res.json().catch(() => ({}));
-        if (res.ok && d.success !== false) ok++; else fail++;
-      } catch { fail++; }
-    }
-    
-    // 移除进度 toast
-    if (toastId) {
-      const el = document.querySelector(`[data-toast-id="${toastId}"]`);
-      if (el) {
-        el.classList.remove('toast-show');
-        setTimeout(() => el.remove(), 300);
+        if (res.ok && d.success !== false) {
+          const n = Number(d.deleted != null ? d.deleted : chunk.length) || 0;
+          success += n;
+          if (n < chunk.length) fail += (chunk.length - n);
+        } else {
+          fail += chunk.length;
+        }
+      } catch {
+        fail += chunk.length;
       }
+
+      const completed = Math.min(total, success + fail);
+      showBatchProgress({
+        title,
+        status: t('batch.processingCurrent', completed, total),
+        completed,
+        total,
+        success,
+        fail,
+        exhausted: 0,
+        concurrency: delConc,
+        showExhaustedStat: false
+      });
     }
-    
-    toast(t('batch.deleteResult', ok, fail), fail ? 'warning' : 'success', { icon: 'fa-solid fa-trash' });
+
+    showBatchProgress({
+      title,
+      status: t('batch.deleteResult', success, fail),
+      completed: total,
+      total,
+      success,
+      fail,
+      exhausted: 0,
+      concurrency: delConc,
+      showExhaustedStat: false
+    });
+    hideBatchProgress(1600);
+
+    toast(t('batch.deleteResult', success, fail), fail ? 'warning' : 'success', { icon: 'fa-solid fa-trash' });
     selectedAccounts.clear();
     updateBatchBar();
-    loadAccounts(); loadStats();
+    await loadAccounts();
+    loadStats();
   }
+
+  async function batchRefreshModels() {
+    const ids = Array.from(selectedAccounts);
+    if (!ids.length) return;
+    const concurrency = Math.min(Math.max(1, batchTestConcurrency || 5), ids.length);
+    const ok = await confirmAction(t('batch.confirmRefreshModels', ids.length, concurrency), {
+      title: t('batch.refreshModels'),
+      confirmText: t('common.confirm'),
+      variant: 'primary'
+    });
+    if (!ok) return;
+    const { success, fail } = await runBatchJobs({
+      ids,
+      title: t('batch.refreshModels'),
+      runningStatus: t('batch.refreshingModels') || t('batch.refreshing'),
+      concurrency,
+      resultToast: (s, f) => t('batch.refreshModelsResult', s, f),
+      worker: async (id) => {
+        const res = await api('/accounts/' + id + '/models/refresh', { method: 'POST' });
+        const d = await res.json().catch(() => ({}));
+        return res.ok && d.success !== false ? 'success' : 'fail';
+      }
+    });
+
+    toast(t('batch.refreshModelsResult', success, fail), fail ? 'warning' : 'success');
+    selectedAccounts.clear();
+    updateBatchBar();
+  }
+
   async function refreshAllModels() {
     const ok = await confirmAction(t('models.confirmRefreshAll'), {
       title: t('models.refreshAll'),
@@ -1660,6 +1877,7 @@
       detailItem(t('detail.errorCount'), a.errorCount || 0) +
       detailItem(t('detail.totalTokens'), formatNum(a.totalTokens || 0)) +
       detailItem(t('detail.totalCredits'), (a.totalCredits || 0).toFixed(2)) +
+      detailItem(t('detail.dailyCredits'), (a.dailyCredits || 0).toFixed(2)) +
       detailItem(t('detail.dailyRequests'), a.dailyRequests || 0) +
       detailItem(t('detail.dailyTokens'), formatNum(a.dailyTokens || 0)) +
       '</div></div>' +
@@ -1946,6 +2164,13 @@
       const d = await res.json();
       if (d.success) {
         addTestLog(t('accounts.testLog.success', email, elapsed, d.reply), 'ok');
+      } else if (d.exhausted) {
+        addTestLog(t('accounts.testLog.exhausted', email, elapsed, d.error || t('common.unknownError')), 'err');
+        // 先本地标记并即时刷新，再拉服务端状态
+        markLocalAccountExhausted(id);
+        refreshAccountsUIRealtime();
+        await loadAccounts();
+        loadStats();
       } else {
         addTestLog(t('accounts.testLog.failed', email, elapsed, d.error || t('common.unknownError')), 'err');
       }
@@ -1964,6 +2189,14 @@
     $('allowOverUsage').checked = d.allowOverUsage || false;
     $('showExhaustedAccounts').checked = d.showExhaustedAccounts !== false;
     showExhaustedAccounts = d.showExhaustedAccounts !== false;
+    const conc = parseInt(d.batchTestConcurrency, 10);
+    batchTestConcurrency = Number.isFinite(conc) && conc > 0 ? Math.min(200, Math.max(1, conc)) : 5;
+    const concInput = $('batchTestConcurrency');
+    if (concInput) concInput.value = String(batchTestConcurrency);
+    const impConc = parseInt(d.importConcurrency, 10);
+    importConcurrency = Number.isFinite(impConc) && impConc > 0 ? Math.min(200, Math.max(1, impConc)) : 100;
+    const impInput = $('importConcurrency');
+    if (impInput) impInput.value = String(importConcurrency);
     await Promise.all([loadThinkingConfig(), loadEndpointConfig(), loadProxyConfig(), loadPromptFilter(), loadApiKeys()]);
     refreshCustomSelects();
   }
@@ -2070,11 +2303,30 @@
   async function saveOverUsageConfig() {
     const allowOverUsage = $('allowOverUsage').checked;
     const showExhaustedAccountsValue = $('showExhaustedAccounts').checked;
-    await api('/settings', { method: 'POST', body: JSON.stringify({ allowOverUsage, showExhaustedAccounts: showExhaustedAccountsValue }) });
+    const rawConc = parseInt(($('batchTestConcurrency') && $('batchTestConcurrency').value) || '5', 10);
+    if (!Number.isFinite(rawConc) || rawConc < 1 || rawConc > 200) {
+      toast(t('settings.batchTestConcurrencyInvalid'), 'warning');
+      return;
+    }
+    const rawImportConc = parseInt(($('importConcurrency') && $('importConcurrency').value) || '100', 10);
+    if (!Number.isFinite(rawImportConc) || rawImportConc < 1 || rawImportConc > 200) {
+      toast(t('settings.importConcurrencyInvalid'), 'warning');
+      return;
+    }
+    await api('/settings', {
+      method: 'POST',
+      body: JSON.stringify({
+        allowOverUsage,
+        showExhaustedAccounts: showExhaustedAccountsValue,
+        batchTestConcurrency: rawConc,
+        importConcurrency: rawImportConc
+      })
+    });
     showExhaustedAccounts = showExhaustedAccountsValue;
-    currentPage = 1;
+    batchTestConcurrency = rawConc;
+    importConcurrency = rawImportConc;
     renderAccounts();
-    toast(t('settings.overUsageSaved'), 'success');
+    toast(t('common.saved'), 'success');
   }
   async function changePassword() {
     const np = $('newPassword').value;
@@ -2775,8 +3027,8 @@
     progressSkipped.textContent = '0';
     progressPending.textContent = total;
 
-    // 并发控制：同时处理多个导入请求
-    const CONCURRENT_LIMIT = 100;
+    // 并发控制：独立「导入并发数」配置（1–200，默认 100）
+    const CONCURRENT_LIMIT = Math.min(200, Math.max(1, importConcurrency || 100));
     let completed = 0;
 
     // 处理单个账号导入
@@ -2829,7 +3081,7 @@
       progressPending.textContent = total - completed;
       progressFill.style.width = `${(completed / total) * 100}%`;
       progressCount.textContent = `${completed}/${total}`;
-      progressStatus.textContent = t('import.progress.processing', completed, total);
+      progressStatus.textContent = t('import.progress.processing', completed, total) + ' · ' + t('batch.progressConcurrency', CONCURRENT_LIMIT);
       if (fail > 0) progressFill.classList.add('with-errors');
     };
 
@@ -3618,6 +3870,7 @@
     html += statsCard(t('api.statsDailyFailed'), formatNum(d.dailyFailedRequests || 0), 'danger');
     html += statsCard(t('api.statsTotalTokens'), formatNum(d.totalTokens || 0), '');
     html += statsCard(t('api.statsTotalCredits'), (d.totalCredits || 0).toFixed(2), 'info');
+    html += statsCard(t('api.statsDailyCredits'), (d.dailyCredits || 0).toFixed(2), 'info');
     html += '</div>';
     if (d.uptime !== undefined) {
       html += '<div class="stats-view-uptime"><i class="fa-solid fa-clock"></i> ' + escapeHtml(t('api.statsUptime')) + ': <strong>' + escapeHtml(formatUptime(d.uptime)) + '</strong></div>';

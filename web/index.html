@@ -163,6 +163,10 @@
                   <span class="stat-value-sm" id="statTokens">0</span>
                   <span class="stat-label" data-i18n="stats.tokens"></span>
                 </span>
+                <span class="stat-sub-sec">
+                  <span class="stat-value-sm" id="statCredits">0</span>
+                  <span class="stat-label" data-i18n="stats.credits"></span>
+                </span>
               </div>
               <div class="stat-sub stat-sub--daily">
                 <span class="stat-sub-sec">
@@ -173,6 +177,10 @@
                 <span class="stat-sub-sec">
                   <span class="stat-value-sm stat-value-primary" id="statDailyTokens">0</span>
                   <span class="stat-label" data-i18n="stats.dailyTokens"></span>
+                </span>
+                <span class="stat-sub-sec">
+                  <span class="stat-value-sm stat-value-primary" id="statDailyCredits">0</span>
+                  <span class="stat-label" data-i18n="stats.dailyCredits"></span>
                 </span>
               </div>
             </div>
@@ -251,6 +259,7 @@
               <button class="btn btn-secondary btn-xs" data-batch="refresh" data-i18n="batch.refresh"></button>
               <button class="btn btn-secondary btn-xs" data-batch="refreshModels"
                 data-i18n="batch.refreshModels"></button>
+              <button class="btn btn-secondary btn-xs" data-batch="test" data-i18n="batch.test"></button>
               <button class="btn btn-danger btn-xs" data-batch="delete" data-i18n="batch.delete"></button>
             </div>
             <div class="toolbar-spacer"></div>
@@ -266,8 +275,6 @@
               <option value="default" data-i18n="sort.default"></option>
               <option value="usage_desc" data-i18n="sort.usageDesc"></option>
               <option value="usage_asc" data-i18n="sort.usageAsc"></option>
-              <option value="usage_current_desc" data-i18n="sort.usageCurrentDesc"></option>
-              <option value="usage_current_asc" data-i18n="sort.usageCurrentAsc"></option>
             </select>
           </div>
 
@@ -320,6 +327,16 @@
               <span data-i18n="settings.showExhaustedAccounts"></span>
             </label>
             <small data-i18n="settings.showExhaustedAccountsHint"></small>
+          </div>
+          <div class="form-group">
+            <label data-i18n="settings.batchTestConcurrency"></label>
+            <input type="number" id="batchTestConcurrency" min="1" max="200" step="1" value="5" />
+            <small data-i18n="settings.batchTestConcurrencyHint"></small>
+          </div>
+          <div class="form-group">
+            <label data-i18n="settings.importConcurrency"></label>
+            <input type="number" id="importConcurrency" min="1" max="200" step="1" value="100" />
+            <small data-i18n="settings.importConcurrencyHint"></small>
           </div>
           <button class="btn btn-primary" id="saveOverUsageBtn" data-i18n="settings.saveUsage"></button>
         </div>

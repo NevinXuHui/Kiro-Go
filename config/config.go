@@ -110,9 +110,10 @@ type Account struct {
 	TotalCredits float64 `json:"totalCredits,omitempty"` // Cumulative credits consumed
 
 	// Daily statistics (reset at midnight)
-	DailyRequests int    `json:"dailyRequests,omitempty"` // Today's requests
-	DailyTokens   int    `json:"dailyTokens,omitempty"`   // Today's tokens
-	DailyDate     string `json:"dailyDate,omitempty"`     // Current date in YYYY-MM-DD format
+	DailyRequests int     `json:"dailyRequests,omitempty"` // Today's requests
+	DailyTokens   int     `json:"dailyTokens,omitempty"`   // Today's tokens
+	DailyCredits  float64 `json:"dailyCredits,omitempty"`  // Today's credits consumed
+	DailyDate     string  `json:"dailyDate,omitempty"`     // Current date in YYYY-MM-DD format
 }
 
 // PromptFilterRule defines a single custom prompt sanitization rule.
@@ -184,6 +185,15 @@ type Config struct {
 	// in the admin panel account list. Defaults to true.
 	ShowExhaustedAccounts *bool `json:"showExhaustedAccounts,omitempty"`
 
+	// BatchTestConcurrency controls how many account ops run in parallel
+	// from the admin panel batch actions (enable/disable/refresh/test/delete).
+	// Defaults to 5; clamped to 1..200.
+	BatchTestConcurrency int `json:"batchTestConcurrency,omitempty"`
+
+	// ImportConcurrency controls how many credential imports run in parallel.
+	// Defaults to 100; clamped to 1..200. Independent from BatchTestConcurrency.
+	ImportConcurrency int `json:"importConcurrency,omitempty"`
+
 	// Proxy configuration: optional outbound proxy for Kiro API requests
 	// Format: "socks5://host:port", "socks5://user:pass@host:port",
 	//         "http://host:port",  "http://user:pass@host:port"
@@ -224,8 +234,9 @@ type Config struct {
 	DailyRequests        int    `json:"dailyRequests,omitempty"`        // Today's total requests
 	DailySuccessRequests int    `json:"dailySuccessRequests,omitempty"` // Today's successful requests
 	DailyFailedRequests  int    `json:"dailyFailedRequests,omitempty"`  // Today's failed requests
-	DailyTokens          int    `json:"dailyTokens,omitempty"`          // Today's total tokens
-	DailyDate            string `json:"dailyDate,omitempty"`            // Current date in YYYY-MM-DD format
+	DailyTokens          int     `json:"dailyTokens,omitempty"`          // Today's total tokens
+	DailyCredits         float64 `json:"dailyCredits,omitempty"`         // Today's total credits consumed
+	DailyDate            string  `json:"dailyDate,omitempty"`            // Current date in YYYY-MM-DD format
 }
 
 // AccountInfo contains account metadata retrieved from Kiro API.
@@ -529,15 +540,47 @@ func UpdateAccountProfileArn(id, profileArn string) error {
 }
 
 func DeleteAccount(id string) error {
-	cfgLock.Lock()
-	defer cfgLock.Unlock()
-	for i, a := range cfg.Accounts {
-		if a.ID == id {
-			cfg.Accounts = append(cfg.Accounts[:i], cfg.Accounts[i+1:]...)
-			return Save()
+	_, err := DeleteAccounts([]string{id})
+	return err
+}
+
+// DeleteAccounts removes multiple accounts under one lock and a single disk write.
+// Prefer this for admin batch-delete: concurrent per-id deletes serialize on cfgLock
+// and rewrite the full config JSON each time, which looks non-concurrent.
+func DeleteAccounts(ids []string) (int, error) {
+	if len(ids) == 0 {
+		return 0, nil
+	}
+	idSet := make(map[string]struct{}, len(ids))
+	for _, id := range ids {
+		if id != "" {
+			idSet[id] = struct{}{}
 		}
 	}
-	return nil
+	if len(idSet) == 0 {
+		return 0, nil
+	}
+
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+
+	kept := make([]Account, 0, len(cfg.Accounts))
+	deleted := 0
+	for _, a := range cfg.Accounts {
+		if _, ok := idSet[a.ID]; ok {
+			deleted++
+			continue
+		}
+		kept = append(kept, a)
+	}
+	if deleted == 0 {
+		return 0, nil
+	}
+	cfg.Accounts = kept
+	if err := Save(); err != nil {
+		return 0, err
+	}
+	return deleted, nil
 }
 
 func UpdateAccountToken(id, accessToken, refreshToken string, expiresAt int64) error {
@@ -615,15 +658,15 @@ func GetStats() (int, int, int, int, float64) {
 // Callers must pass already day-aligned counters (memory rolled to "today").
 // On date change we adopt the caller's values rather than forcing zero, so a
 // concurrent first request of the new day is not discarded.
-func UpdateDailyStats(dailyReq, dailySuccess, dailyFailed, dailyTokens int) error {
+func UpdateDailyStats(dailyReq, dailySuccess, dailyFailed, dailyTokens int, dailyCredits float64) error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
 
 	today := time.Now().Format("2006-01-02")
 
 	if cfg.DailyDate != today {
-		logger.Infof("[DailyStats] Day changed from %s to %s, writing new-day stats: requests=%d success=%d failed=%d tokens=%d",
-			cfg.DailyDate, today, dailyReq, dailySuccess, dailyFailed, dailyTokens)
+		logger.Infof("[DailyStats] Day changed from %s to %s, writing new-day stats: requests=%d success=%d failed=%d tokens=%d credits=%.4f",
+			cfg.DailyDate, today, dailyReq, dailySuccess, dailyFailed, dailyTokens, dailyCredits)
 		cfg.DailyDate = today
 	}
 
@@ -631,23 +674,24 @@ func UpdateDailyStats(dailyReq, dailySuccess, dailyFailed, dailyTokens int) erro
 	cfg.DailySuccessRequests = dailySuccess
 	cfg.DailyFailedRequests = dailyFailed
 	cfg.DailyTokens = dailyTokens
+	cfg.DailyCredits = dailyCredits
 	return Save()
 }
 
-// GetDailyStats returns daily statistics (requests, success, failed, tokens, date).
+// GetDailyStats returns daily statistics (requests, success, failed, tokens, credits, date).
 // If the stored date is not today, returns zeros with today's date so callers
 // initialize memory for a fresh day without carrying over yesterday's totals.
-func GetDailyStats() (int, int, int, int, string) {
+func GetDailyStats() (int, int, int, int, float64, string) {
 	cfgLock.RLock()
 	defer cfgLock.RUnlock()
 
 	today := time.Now().Format("2006-01-02")
 
 	if cfg.DailyDate != today {
-		return 0, 0, 0, 0, today
+		return 0, 0, 0, 0, 0, today
 	}
 
-	return cfg.DailyRequests, cfg.DailySuccessRequests, cfg.DailyFailedRequests, cfg.DailyTokens, cfg.DailyDate
+	return cfg.DailyRequests, cfg.DailySuccessRequests, cfg.DailyFailedRequests, cfg.DailyTokens, cfg.DailyCredits, cfg.DailyDate
 }
 
 // ResetDailyStatsIfNeeded checks and resets daily stats at midnight
@@ -662,6 +706,7 @@ func ResetDailyStatsIfNeeded() error {
 		cfg.DailySuccessRequests = 0
 		cfg.DailyFailedRequests = 0
 		cfg.DailyTokens = 0
+		cfg.DailyCredits = 0
 		cfg.DailyDate = today
 		return Save()
 	}
@@ -688,7 +733,7 @@ func UpdateAccountStats(id string, requestCount, errorCount, totalTokens int, to
 // UpdateAccountDailyStats updates daily statistics for an account with automatic reset on date change.
 // The pool already rolls per-account counters before calling this; on date change
 // we must persist the caller's new-day values (typically 1), not force zero.
-func UpdateAccountDailyStats(id string, dailyReq, dailyTokens int) error {
+func UpdateAccountDailyStats(id string, dailyReq, dailyTokens int, dailyCredits float64) error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
 
@@ -697,12 +742,13 @@ func UpdateAccountDailyStats(id string, dailyReq, dailyTokens int) error {
 	for i, a := range cfg.Accounts {
 		if a.ID == id {
 			if cfg.Accounts[i].DailyDate != today {
-				logger.Infof("[DailyStats] Account %s day changed from %s to %s, writing new-day stats: requests=%d, tokens=%d",
-					a.Email, cfg.Accounts[i].DailyDate, today, dailyReq, dailyTokens)
+				logger.Infof("[DailyStats] Account %s day changed from %s to %s, writing new-day stats: requests=%d, tokens=%d, credits=%.4f",
+					a.Email, cfg.Accounts[i].DailyDate, today, dailyReq, dailyTokens, dailyCredits)
 				cfg.Accounts[i].DailyDate = today
 			}
 			cfg.Accounts[i].DailyRequests = dailyReq
 			cfg.Accounts[i].DailyTokens = dailyTokens
+			cfg.Accounts[i].DailyCredits = dailyCredits
 			return Save()
 		}
 	}
@@ -740,12 +786,39 @@ func ResetAccountDailyStatsIfNeeded() error {
 		if cfg.Accounts[i].DailyDate != today && cfg.Accounts[i].DailyDate != "" {
 			cfg.Accounts[i].DailyRequests = 0
 			cfg.Accounts[i].DailyTokens = 0
+			cfg.Accounts[i].DailyCredits = 0
 			cfg.Accounts[i].DailyDate = today
 			changed = true
 		}
 	}
 
 	if changed {
+		return Save()
+	}
+	return nil
+}
+
+// MarkAccountUsageExhausted marks an account's main quota as fully used so the
+// admin UI and pool treat it as exhausted (usageCurrent >= usageLimit).
+func MarkAccountUsageExhausted(id string) error {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	for i, a := range cfg.Accounts {
+		if a.ID != id {
+			continue
+		}
+		if cfg.Accounts[i].UsageLimit > 0 {
+			if cfg.Accounts[i].UsageCurrent < cfg.Accounts[i].UsageLimit {
+				cfg.Accounts[i].UsageCurrent = cfg.Accounts[i].UsageLimit
+			}
+		} else if cfg.Accounts[i].UsageCurrent > 0 {
+			cfg.Accounts[i].UsageLimit = cfg.Accounts[i].UsageCurrent
+		} else {
+			// No prior quota metadata: synthesize a full bar so UI shows exhausted.
+			cfg.Accounts[i].UsageLimit = 1
+			cfg.Accounts[i].UsageCurrent = 1
+		}
+		cfg.Accounts[i].UsagePercent = 1
 		return Save()
 	}
 	return nil
@@ -993,6 +1066,68 @@ func UpdateShowExhaustedAccounts(show bool) error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
 	cfg.ShowExhaustedAccounts = &show
+	return Save()
+}
+
+// GetBatchTestConcurrency returns admin batch-test concurrency (default 5, range 1..200).
+func GetBatchTestConcurrency() int {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	n := 5
+	if cfg != nil && cfg.BatchTestConcurrency > 0 {
+		n = cfg.BatchTestConcurrency
+	}
+	if n < 1 {
+		n = 1
+	}
+	if n > 200 {
+		n = 200
+	}
+	return n
+}
+
+// UpdateBatchTestConcurrency sets batch-test concurrency and persists the change.
+func UpdateBatchTestConcurrency(n int) error {
+	if n < 1 {
+		n = 1
+	}
+	if n > 200 {
+		n = 200
+	}
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	cfg.BatchTestConcurrency = n
+	return Save()
+}
+
+// GetImportConcurrency returns credential import concurrency (default 100, range 1..200).
+func GetImportConcurrency() int {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	n := 100
+	if cfg != nil && cfg.ImportConcurrency > 0 {
+		n = cfg.ImportConcurrency
+	}
+	if n < 1 {
+		n = 1
+	}
+	if n > 200 {
+		n = 200
+	}
+	return n
+}
+
+// UpdateImportConcurrency sets import concurrency and persists the change.
+func UpdateImportConcurrency(n int) error {
+	if n < 1 {
+		n = 1
+	}
+	if n > 200 {
+		n = 200
+	}
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	cfg.ImportConcurrency = n
 	return Save()
 }
 

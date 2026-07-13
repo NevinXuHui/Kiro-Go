@@ -440,6 +440,7 @@ func (p *AccountPool) UpdateStats(id string, tokens int, credits float64) {
 	var totalCredits float64
 	var lastUsed int64
 	var dailyRequests, dailyTokens int
+	var dailyCredits float64
 	today := time.Now().Format("2006-01-02")
 
 	for i := range p.accounts {
@@ -455,10 +456,12 @@ func (p *AccountPool) UpdateStats(id string, tokens int, credits float64) {
 				if p.accounts[i].DailyDate != today {
 					p.accounts[i].DailyRequests = 0
 					p.accounts[i].DailyTokens = 0
+					p.accounts[i].DailyCredits = 0
 					p.accounts[i].DailyDate = today
 				}
 				p.accounts[i].DailyRequests++
 				p.accounts[i].DailyTokens += tokens
+				p.accounts[i].DailyCredits += credits
 
 				requestCount = p.accounts[i].RequestCount
 				errorCount = p.accounts[i].ErrorCount
@@ -467,6 +470,7 @@ func (p *AccountPool) UpdateStats(id string, tokens int, credits float64) {
 				lastUsed = p.accounts[i].LastUsed
 				dailyRequests = p.accounts[i].DailyRequests
 				dailyTokens = p.accounts[i].DailyTokens
+				dailyCredits = p.accounts[i].DailyCredits
 				updated = true
 				continue
 			}
@@ -477,13 +481,14 @@ func (p *AccountPool) UpdateStats(id string, tokens int, credits float64) {
 			p.accounts[i].LastUsed = lastUsed
 			p.accounts[i].DailyRequests = dailyRequests
 			p.accounts[i].DailyTokens = dailyTokens
+			p.accounts[i].DailyCredits = dailyCredits
 			p.accounts[i].DailyDate = today
 		}
 	}
 	if updated {
 		go config.UpdateAccountStats(id, requestCount, errorCount, totalTokens, totalCredits, lastUsed)
 		// 更新每日统计，UpdateAccountDailyStats 会处理跨日期的情况
-		go config.UpdateAccountDailyStats(id, dailyRequests, dailyTokens)
+		go config.UpdateAccountDailyStats(id, dailyRequests, dailyTokens, dailyCredits)
 	}
 }
 

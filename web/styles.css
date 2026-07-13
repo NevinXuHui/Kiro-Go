@@ -3828,3 +3828,49 @@ img.brand-icon {
 .import-progress-stat.pending {
   color: var(--muted-foreground);
 }
+
+
+/* Batch test / batch op progress panel */
+.batch-progress-panel {
+  position: fixed;
+  right: 1.25rem;
+  bottom: 1.25rem;
+  z-index: 1200;
+  width: min(360px, calc(100vw - 2rem));
+  background: var(--card-bg, var(--bg-elevated, #1e1e24));
+  border: 1px solid var(--border-color, rgba(255,255,255,.08));
+  border-radius: 12px;
+  box-shadow: 0 12px 40px rgba(0,0,0,.28);
+  padding: 1rem 1.1rem;
+}
+.batch-progress-panel.hidden { display: none !important; }
+.batch-progress-panel .import-progress-container {
+  margin: 0;
+  padding: 0;
+  border: none;
+  background: transparent;
+}
+.batch-progress-panel .batch-progress-title {
+  font-size: 0.9rem;
+  font-weight: 600;
+  margin-bottom: 0.65rem;
+}
+.batch-progress-panel .import-progress-stat.exhausted {
+  color: #f59e0b;
+}
+
+.batch-progress-meta {
+  margin: 0.25rem 0 0.55rem;
+  font-size: 0.78rem;
+  opacity: 0.75;
+}
+.batch-progress-panel .import-progress-status {
+  display: block;
+  font-weight: 600;
+  line-height: 1.35;
+  word-break: break-word;
+}
+.batch-progress-panel .import-progress-header {
+  align-items: flex-start;
+  gap: 0.5rem;
+}

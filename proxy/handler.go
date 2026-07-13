@@ -53,7 +53,8 @@ type Handler struct {
 	dailySuccessRequests int64
 	dailyFailedRequests  int64
 	dailyTokens          int64
-	dailyDate            string // YYYY-MM-DD，与 daily* 计数对应
+	dailyCredits         float64 // 今日积分/额度消耗（与 totalCredits 同源）
+	dailyDate            string  // YYYY-MM-DD，与 daily* 计数对应
 	dailyMu              sync.Mutex
 	// 模型缓存
 	cachedModels    []ModelInfo
@@ -240,7 +241,7 @@ func NewHandler() *Handler {
 	applyProxyConfig(config.GetProxyURL())
 
 	totalReq, successReq, failedReq, totalTokens, totalCredits := config.GetStats()
-	dailyReq, dailySuccess, dailyFailed, dailyTokens, dailyDate := config.GetDailyStats()
+	dailyReq, dailySuccess, dailyFailed, dailyTokens, dailyCredits, dailyDate := config.GetDailyStats()
 	h := &Handler{
 		pool:                 pool.GetPool(),
 		totalRequests:        int64(totalReq),
@@ -252,6 +253,7 @@ func NewHandler() *Handler {
 		dailySuccessRequests: int64(dailySuccess),
 		dailyFailedRequests:  int64(dailyFailed),
 		dailyTokens:          int64(dailyTokens),
+		dailyCredits:         dailyCredits,
 		dailyDate:            dailyDate,
 		startTime:       time.Now().Unix(),
 		stopRefresh:     make(chan struct{}),
@@ -477,6 +479,7 @@ func (h *Handler) handleStats(w http.ResponseWriter, r *http.Request) {
 		"dailySuccessRequests": atomic.LoadInt64(&h.dailySuccessRequests),
 		"dailyFailedRequests":  atomic.LoadInt64(&h.dailyFailedRequests),
 		"dailyTokens":          atomic.LoadInt64(&h.dailyTokens),
+		"dailyCredits":         h.getDailyCredits(),
 		"dailyDate":            time.Now().Format("2006-01-02"),
 		"uptime":               time.Now().Unix() - h.startTime,
 	})
@@ -1350,20 +1353,22 @@ func (h *Handler) rollDailyCountersLocked(today string) {
 	prevSuccess := atomic.LoadInt64(&h.dailySuccessRequests)
 	prevFailed := atomic.LoadInt64(&h.dailyFailedRequests)
 	prevTok := atomic.LoadInt64(&h.dailyTokens)
+	prevCredits := h.dailyCredits
 	atomic.StoreInt64(&h.dailyRequests, 0)
 	atomic.StoreInt64(&h.dailySuccessRequests, 0)
 	atomic.StoreInt64(&h.dailyFailedRequests, 0)
 	atomic.StoreInt64(&h.dailyTokens, 0)
+	h.dailyCredits = 0
 	h.dailyDate = today
 	if prevDate != "" {
-		logger.Infof("[DailyStats] memory day rolled from %s to %s, discarded in-memory totals: requests=%d success=%d failed=%d tokens=%d",
-			prevDate, today, prevReq, prevSuccess, prevFailed, prevTok)
+		logger.Infof("[DailyStats] memory day rolled from %s to %s, discarded in-memory totals: requests=%d success=%d failed=%d tokens=%d credits=%.4f",
+			prevDate, today, prevReq, prevSuccess, prevFailed, prevTok, prevCredits)
 	}
 }
 
-// bumpDailyStats 按自然日滚动后累加今日请求/成功/失败/Token，与 ensure 共用一把锁避免跨日丢计数。
+// bumpDailyStats 按自然日滚动后累加今日请求/成功/失败/Token/Credits。
 // success=true 计成功，false 计失败。
-func (h *Handler) bumpDailyStats(success bool, tokens int64) {
+func (h *Handler) bumpDailyStats(success bool, tokens int64, credits float64) {
 	h.dailyMu.Lock()
 	defer h.dailyMu.Unlock()
 	h.rollDailyCountersLocked(time.Now().Format("2006-01-02"))
@@ -1376,6 +1381,17 @@ func (h *Handler) bumpDailyStats(success bool, tokens int64) {
 	if tokens != 0 {
 		atomic.AddInt64(&h.dailyTokens, tokens)
 	}
+	if credits != 0 {
+		h.dailyCredits += credits
+	}
+}
+
+// getDailyCredits 线程安全读取今日积分消耗（需在 ensure 后用于展示）。
+func (h *Handler) getDailyCredits() float64 {
+	h.dailyMu.Lock()
+	defer h.dailyMu.Unlock()
+	h.rollDailyCountersLocked(time.Now().Format("2006-01-02"))
+	return h.dailyCredits
 }
 
 // saveStats 保存统计到配置文件
@@ -1389,11 +1405,13 @@ func (h *Handler) saveStats() {
 	)
 	// 跨日时先滚动内存计数，再把「当日」值写入配置
 	h.ensureDailyCounters()
+	dailyCredits := h.getDailyCredits()
 	config.UpdateDailyStats(
 		int(atomic.LoadInt64(&h.dailyRequests)),
 		int(atomic.LoadInt64(&h.dailySuccessRequests)),
 		int(atomic.LoadInt64(&h.dailyFailedRequests)),
 		int(atomic.LoadInt64(&h.dailyTokens)),
+		dailyCredits,
 	)
 }
 
@@ -1411,7 +1429,8 @@ func (h *Handler) backgroundDailyReset() {
 			succ := int(atomic.LoadInt64(&h.dailySuccessRequests))
 			fail := int(atomic.LoadInt64(&h.dailyFailedRequests))
 			tok := int(atomic.LoadInt64(&h.dailyTokens))
-			if err := config.UpdateDailyStats(req, succ, fail, tok); err != nil {
+			cr := h.getDailyCredits()
+			if err := config.UpdateDailyStats(req, succ, fail, tok, cr); err != nil {
 				logger.Warnf("[DailyReset] failed to persist daily stats: %v", err)
 			}
 		case <-h.stopRefresh:
@@ -1441,7 +1460,7 @@ func (h *Handler) recordSuccess(inputTokens, outputTokens int, credits float64) 
 	atomic.AddInt64(&h.totalTokens, int64(inputTokens+outputTokens))
 	h.addCredits(credits)
 	// 增加每日统计（先按自然日滚动）
-	h.bumpDailyStats(true, int64(inputTokens+outputTokens))
+	h.bumpDailyStats(true, int64(inputTokens+outputTokens), credits)
 }
 
 // recordSuccessForApiKey is recordSuccess + per-API-key usage attribution.
@@ -1462,7 +1481,7 @@ func (h *Handler) recordFailureWithDetails(endpoint, model, accountID string, er
 	atomic.AddInt64(&h.totalRequests, 1)
 	atomic.AddInt64(&h.failedRequests, 1)
 	// 增加每日统计（先按自然日滚动）
-	h.bumpDailyStats(false, 0)
+	h.bumpDailyStats(false, 0, 0)
 
 	if err == nil {
 		return
@@ -2399,9 +2418,9 @@ func (h *Handler) apiGetAccounts(w http.ResponseWriter, r *http.Request) {
 		isActive := stats.LastUsed > 0 && (now-stats.LastUsed) <= 30
 
 		// 每日统计仅返回「今天」的值，避免前端把昨日计数显示成今日
-		dailyRequests, dailyTokens, dailyDate := stats.DailyRequests, stats.DailyTokens, stats.DailyDate
+		dailyRequests, dailyTokens, dailyCredits, dailyDate := stats.DailyRequests, stats.DailyTokens, stats.DailyCredits, stats.DailyDate
 		if dailyDate != today {
-			dailyRequests, dailyTokens = 0, 0
+			dailyRequests, dailyTokens, dailyCredits = 0, 0, 0
 			dailyDate = today
 		}
 
@@ -2449,6 +2468,7 @@ func (h *Handler) apiGetAccounts(w http.ResponseWriter, r *http.Request) {
 			"isActive":          isActive,
 			"dailyRequests":     dailyRequests,
 			"dailyTokens":       dailyTokens,
+			"dailyCredits":      dailyCredits,
 			"dailyDate":         dailyDate,
 		}
 	}
@@ -2646,11 +2666,11 @@ func (h *Handler) apiSetAccountOverage(w http.ResponseWriter, r *http.Request, i
 	})
 }
 
-// apiBatchAccounts 批量操作账号（启用/禁用/刷新）
+// apiBatchAccounts 批量操作账号（启用/禁用/刷新/删除）
 func (h *Handler) apiBatchAccounts(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		IDs    []string `json:"ids"`
-		Action string   `json:"action"` // "enable", "disable", "refresh"
+		Action string   `json:"action"` // "enable", "disable", "refresh", "delete"
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		w.WriteHeader(400)
@@ -2698,6 +2718,20 @@ func (h *Handler) apiBatchAccounts(w http.ResponseWriter, r *http.Request) {
 			}(acc)
 		}
 		json.NewEncoder(w).Encode(map[string]interface{}{"success": true, "count": len(req.IDs)})
+
+	case "delete":
+		deleted, err := config.DeleteAccounts(req.IDs)
+		if err != nil {
+			w.WriteHeader(500)
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+		h.pool.Reload()
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success": true,
+			"deleted": deleted,
+			"count":   deleted,
+		})
 
 	case "refresh":
 		successCount := 0
@@ -3146,6 +3180,7 @@ func (h *Handler) apiGetStatus(w http.ResponseWriter, r *http.Request) {
 		"dailySuccessRequests": atomic.LoadInt64(&h.dailySuccessRequests),
 		"dailyFailedRequests":  atomic.LoadInt64(&h.dailyFailedRequests),
 		"dailyTokens":          atomic.LoadInt64(&h.dailyTokens),
+		"dailyCredits":         h.getDailyCredits(),
 		"dailyDate":            time.Now().Format("2006-01-02"),
 		"uptime":               time.Now().Unix() - h.startTime,
 	})
@@ -3159,6 +3194,8 @@ func (h *Handler) apiGetSettings(w http.ResponseWriter, r *http.Request) {
 		"host":                  config.GetHost(),
 		"allowOverUsage":        config.GetAllowOverUsage(),
 		"showExhaustedAccounts": config.GetShowExhaustedAccounts(),
+		"batchTestConcurrency":  config.GetBatchTestConcurrency(),
+		"importConcurrency":     config.GetImportConcurrency(),
 	})
 }
 
@@ -3212,6 +3249,8 @@ func (h *Handler) apiUpdateSettings(w http.ResponseWriter, r *http.Request) {
 		Password              string  `json:"password,omitempty"`
 		AllowOverUsage        *bool   `json:"allowOverUsage,omitempty"`
 		ShowExhaustedAccounts *bool   `json:"showExhaustedAccounts,omitempty"`
+		BatchTestConcurrency  *int    `json:"batchTestConcurrency,omitempty"`
+		ImportConcurrency     *int    `json:"importConcurrency,omitempty"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		w.WriteHeader(400)
@@ -3239,6 +3278,24 @@ func (h *Handler) apiUpdateSettings(w http.ResponseWriter, r *http.Request) {
 	// 更新显示已用完账号设置
 	if req.ShowExhaustedAccounts != nil {
 		if err := config.UpdateShowExhaustedAccounts(*req.ShowExhaustedAccounts); err != nil {
+			w.WriteHeader(500)
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+	}
+
+	// 批量操作并发
+	if req.BatchTestConcurrency != nil {
+		if err := config.UpdateBatchTestConcurrency(*req.BatchTestConcurrency); err != nil {
+			w.WriteHeader(500)
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+	}
+
+	// 导入并发（独立配置）
+	if req.ImportConcurrency != nil {
+		if err := config.UpdateImportConcurrency(*req.ImportConcurrency); err != nil {
 			w.WriteHeader(500)
 			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 			return
@@ -3275,6 +3332,7 @@ func (h *Handler) apiResetStats(w http.ResponseWriter, r *http.Request) {
 	atomic.StoreInt64(&h.dailySuccessRequests, 0)
 	atomic.StoreInt64(&h.dailyFailedRequests, 0)
 	atomic.StoreInt64(&h.dailyTokens, 0)
+	h.dailyCredits = 0
 	h.dailyDate = time.Now().Format("2006-01-02")
 	h.dailyMu.Unlock()
 
@@ -3283,7 +3341,7 @@ func (h *Handler) apiResetStats(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 		return
 	}
-	if err := config.UpdateDailyStats(0, 0, 0, 0); err != nil {
+	if err := config.UpdateDailyStats(0, 0, 0, 0, 0); err != nil {
 		w.WriteHeader(500)
 		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 		return
@@ -3365,8 +3423,16 @@ func (h *Handler) apiTestAccount(w http.ResponseWriter, r *http.Request, id stri
 
 	err := CallKiroAPI(account, kiroPayload, callback)
 	if err != nil {
+		// Update account status on quota/auth failures (e.g. 402 MONTHLY_REQUEST_COUNT → exhausted).
+		h.handleAccountFailure(account, err)
+		exhausted := isMonthlyQuotaErrorMessage(err.Error()) || isOverageErrorMessage(err.Error())
 		w.WriteHeader(500)
-		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success":   false,
+			"error":     err.Error(),
+			"exhausted": exhausted,
+			"model":     req.Model,
+		})
 		return
 	}
 
