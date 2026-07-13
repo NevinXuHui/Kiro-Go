@@ -23,6 +23,13 @@
     return FILTER_STATUS_VALUES.has(saved) ? saved : 'all';
   }
   let filterStatus = loadSavedFilterStatus();
+  const SORT_BY_KEY = 'kiro_sort_by';
+  const SORT_BY_VALUES = new Set(['default', 'usage_desc', 'usage_asc', 'usage_current_desc', 'usage_current_asc']);
+  function loadSavedSortBy() {
+    const saved = localStorage.getItem(SORT_BY_KEY) || 'default';
+    return SORT_BY_VALUES.has(saved) ? saved : 'default';
+  }
+  let sortBy = loadSavedSortBy();
   let currentPage = 1;
   let pageSize = 20;
   let showExhaustedAccounts = true;
@@ -115,6 +122,7 @@
     applyTheme(getThemePref());
     refreshCustomSelects();
     applyFilterStatusToSelect();
+    applySortByToSelect();
   }
   async function setLang(lang) {
     currentLang = lang;
@@ -270,7 +278,7 @@
     const wrap = document.createElement('div');
     wrap.className = 'custom-select';
     wrap.dataset.customSelect = 'true';
-    if (select.id === 'filterStatusSelect') wrap.classList.add('custom-select-filter');
+    if (select.id === 'filterStatusSelect' || select.id === 'sortBySelect') wrap.classList.add('custom-select-filter');
 
     const trigger = document.createElement('button');
     trigger.type = 'button';
@@ -327,8 +335,9 @@
   function refreshCustomSelects(root) {
     enhanceCustomSelects(root);
     qsa('select.custom-select-native', root || document).forEach(renderCustomSelectOptions);
-    // 自定义下拉重建后，把状态筛选恢复为内存/localStorage 中的值
+    // 自定义下拉重建后，把筛选/排序恢复为内存/localStorage 中的值
     applyFilterStatusToSelect();
+    applySortByToSelect();
   }
   function positionOpenCustomSelects() {
     qsa('select.custom-select-native').forEach(placeCustomSelectContent);
@@ -798,8 +807,9 @@
     const res = await api('/accounts');
     accountsData = await res.json();
     updateAccountStats();
-    // 刷新列表时保持用户选择的状态筛选，不要回到「全部」
+    // 刷新列表时保持用户选择的状态筛选与排序
     applyFilterStatusToSelect();
+    applySortByToSelect();
     renderAccounts();
   }
 
@@ -828,22 +838,69 @@
   }
 
   // Account list
+  function getAccountUsagePercent(a) {
+    if (a.usagePercent != null && !Number.isNaN(Number(a.usagePercent))) {
+      return Number(a.usagePercent);
+    }
+    if (a.usageLimit > 0) return Number(a.usageCurrent || 0) / Number(a.usageLimit);
+    return -1; // 无配额的账号排到对应端
+  }
+  function getAccountUsageCurrent(a) {
+    return Number(a.usageCurrent || 0);
+  }
+  function sortAccounts(list) {
+    if (!sortBy || sortBy === 'default') return list;
+    const arr = list.slice();
+    const cmpNum = (x, y) => (x === y ? 0 : (x < y ? -1 : 1));
+    arr.sort((a, b) => {
+      let av, bv;
+      if (sortBy === 'usage_desc' || sortBy === 'usage_asc') {
+        av = getAccountUsagePercent(a);
+        bv = getAccountUsagePercent(b);
+        // 无用量数据的账号始终靠后
+        if (av < 0 && bv < 0) return 0;
+        if (av < 0) return 1;
+        if (bv < 0) return -1;
+        return sortBy === 'usage_desc' ? cmpNum(bv, av) : cmpNum(av, bv);
+      }
+      if (sortBy === 'usage_current_desc' || sortBy === 'usage_current_asc') {
+        av = getAccountUsageCurrent(a);
+        bv = getAccountUsageCurrent(b);
+        return sortBy === 'usage_current_desc' ? cmpNum(bv, av) : cmpNum(av, bv);
+      }
+      return 0;
+    });
+    return arr;
+  }
+  function isAccountBanned(a) {
+    return !!(a.banStatus && a.banStatus !== 'ACTIVE');
+  }
+  function isAccountExhausted(a) {
+    return a.usageLimit > 0 && a.usageCurrent >= a.usageLimit;
+  }
   function getFilteredAccounts() {
-    return accountsData.filter(a => {
+    const filtered = accountsData.filter(a => {
+      const isBanned = isAccountBanned(a);
+      const isQuotaExhausted = isAccountExhausted(a);
+
       // 过滤已用完的账号（如果设置中关闭了显示）
-      if (!showExhaustedAccounts) {
-        const isQuotaExhausted = a.usageLimit > 0 && a.usageCurrent >= a.usageLimit;
-        if (isQuotaExhausted) return false;
+      // 显式筛选「已用完」时仍展示
+      if (!showExhaustedAccounts && isQuotaExhausted && filterStatus !== 'exhausted') {
+        return false;
       }
 
       // 状态筛选
-      if (filterStatus === 'enabled' && !a.enabled) return false;
-      if (filterStatus === 'disabled' && (a.enabled || (a.banStatus && a.banStatus !== 'ACTIVE'))) return false;
-      if (filterStatus === 'exhausted') {
-        const isQuotaExhausted = a.usageLimit > 0 && a.usageCurrent >= a.usageLimit;
+      // 「已启用」= 开启中、未封禁、未用完（与顶部「正常」统计一致）
+      if (filterStatus === 'enabled') {
+        if (!a.enabled || isBanned || isQuotaExhausted) return false;
+      } else if (filterStatus === 'disabled') {
+        // 已禁用：关闭状态，且不是封禁/已用完（后两者有独立筛选项）
+        if (a.enabled || isBanned || isQuotaExhausted) return false;
+      } else if (filterStatus === 'exhausted') {
         if (!isQuotaExhausted) return false;
+      } else if (filterStatus === 'banned') {
+        if (!isBanned) return false;
       }
-      if (filterStatus === 'banned' && (!a.banStatus || a.banStatus === 'ACTIVE')) return false;
 
       // 关键词搜索
       if (filterKeyword) {
@@ -852,12 +909,20 @@
       }
       return true;
     });
+    return sortAccounts(filtered);
   }
   function applyFilterStatusToSelect() {
     const sel = $('filterStatusSelect');
     if (!sel) return;
     if (!FILTER_STATUS_VALUES.has(filterStatus)) filterStatus = 'all';
     if (sel.value !== filterStatus) sel.value = filterStatus;
+    if (typeof syncCustomSelect === 'function') syncCustomSelect(sel);
+  }
+  function applySortByToSelect() {
+    const sel = $('sortBySelect');
+    if (!sel) return;
+    if (!SORT_BY_VALUES.has(sortBy)) sortBy = 'default';
+    if (sel.value !== sortBy) sel.value = sortBy;
     if (typeof syncCustomSelect === 'function') syncCustomSelect(sel);
   }
   function setFilterStatus(status, { resetPage = true } = {}) {
@@ -867,14 +932,29 @@
     if (resetPage) currentPage = 1;
     renderAccounts();
   }
+  function setSortBy(value, { resetPage = true } = {}) {
+    sortBy = SORT_BY_VALUES.has(value) ? value : 'default';
+    try { localStorage.setItem(SORT_BY_KEY, sortBy); } catch (_) {}
+    applySortByToSelect();
+    if (resetPage) currentPage = 1;
+    renderAccounts();
+  }
   function onFilterChange() {
     filterKeyword = $('filterSearch').value;
-    const next = $('filterStatusSelect').value;
-    if (next !== filterStatus) {
-      filterStatus = FILTER_STATUS_VALUES.has(next) ? next : 'all';
+    const nextStatus = $('filterStatusSelect') ? $('filterStatusSelect').value : filterStatus;
+    const nextSort = $('sortBySelect') ? $('sortBySelect').value : sortBy;
+    let pageReset = false;
+    if (nextStatus !== filterStatus) {
+      filterStatus = FILTER_STATUS_VALUES.has(nextStatus) ? nextStatus : 'all';
       try { localStorage.setItem(FILTER_STATUS_KEY, filterStatus); } catch (_) {}
-      currentPage = 1;
+      pageReset = true;
     }
+    if (nextSort !== sortBy) {
+      sortBy = SORT_BY_VALUES.has(nextSort) ? nextSort : 'default';
+      try { localStorage.setItem(SORT_BY_KEY, sortBy); } catch (_) {}
+      pageReset = true;
+    }
+    if (pageReset) currentPage = 1;
     renderAccounts();
   }
   function toggleSelectAll(checked) {
@@ -3220,6 +3300,8 @@
 
     $('filterSearch').addEventListener('input', onFilterChange);
     $('filterStatusSelect').addEventListener('change', onFilterChange);
+    const sortBySelect = $('sortBySelect');
+    if (sortBySelect) sortBySelect.addEventListener('change', onFilterChange);
 
     $('accountsList').addEventListener('click', e => {
       const cb = e.target.closest('.account-checkbox');
@@ -3572,6 +3654,7 @@
     if (yr) yr.textContent = new Date().getFullYear();
     wireEvents();
     applyFilterStatusToSelect();
+    applySortByToSelect();
     if (password) tryAutoLogin();
     setInterval(() => {
       if (!$('mainPage').classList.contains('hidden')) loadStats();
