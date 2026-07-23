@@ -156,11 +156,8 @@ func HasApiKeys() bool {
 	return len(cfg.ApiKeys) > 0
 }
 
-// RecordApiKeyUsage atomically adds tokens and credits to the entry's counters,
-// updates LastUsedAt, increments RequestsCount, and persists.
-func RecordApiKeyUsage(id string, tokens int64, credits float64) error {
-	cfgLock.Lock()
-	defer cfgLock.Unlock()
+// recordApiKeyUsageLocked updates API key usage counters. Caller must hold cfgLock.
+func recordApiKeyUsageLocked(id string, tokens int64, credits float64) error {
 	if cfg == nil {
 		return errors.New("config not initialized")
 	}
@@ -174,10 +171,29 @@ func RecordApiKeyUsage(id string, tokens int64, credits float64) error {
 			}
 			cfg.ApiKeys[i].RequestsCount++
 			cfg.ApiKeys[i].LastUsedAt = time.Now().Unix()
-			return saveLocked()
+			return nil
 		}
 	}
 	return errors.New("api key not found")
+}
+
+// RecordApiKeyUsage atomically adds tokens and credits to the entry's counters,
+// updates LastUsedAt, increments RequestsCount, and persists immediately.
+func RecordApiKeyUsage(id string, tokens int64, credits float64) error {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	if err := recordApiKeyUsageLocked(id, tokens, credits); err != nil {
+		return err
+	}
+	return saveLocked()
+}
+
+// RecordApiKeyUsageDeferred updates API key usage in memory only.
+// Persistence is deferred to the background runtime stats flush.
+func RecordApiKeyUsageDeferred(id string, tokens int64, credits float64) error {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	return recordApiKeyUsageLocked(id, tokens, credits)
 }
 
 // ResetApiKeyUsage clears TokensUsed/CreditsUsed/RequestsCount for the entry.

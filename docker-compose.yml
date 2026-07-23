@@ -4,9 +4,13 @@ services:
   kiro-go:
     build: .
     ports:
-      - "8080:8080"
+      - "8991:8991"
     volumes:
       - ./data:/app/data
     environment:
       - CONFIG_PATH=/app/data/config.json
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
     restart: unless-stopped

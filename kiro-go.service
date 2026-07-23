@@ -9,6 +9,7 @@ WorkingDirectory=/root/Kiro-Go
 ExecStart=/root/Kiro-Go/kiro-go
 Restart=on-failure
 RestartSec=5s
+LimitNOFILE=65536
 
 # 环境变量（可选）
 Environment="KIRO_PORT=8991"

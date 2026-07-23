@@ -14,6 +14,8 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"kiro-go/config"
 	"kiro-go/logger"
@@ -22,7 +24,9 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
+	"syscall"
 	"time"
 )
 
@@ -75,7 +79,38 @@ func main() {
 		IdleTimeout:       120 * time.Second,
 	}
 
-	if err := srv.ListenAndServe(); err != nil {
-		logger.Fatalf("Server failed: %v", err)
+	serverErr := make(chan error, 1)
+	go func() {
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			serverErr <- err
+			return
+		}
+		serverErr <- nil
+	}()
+
+	sigCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	select {
+	case <-sigCtx.Done():
+		logger.Infof("Shutdown signal received, draining connections...")
+	case err := <-serverErr:
+		if err != nil {
+			logger.Fatalf("Server failed: %v", err)
+		}
+		return
 	}
+
+	// Allow long-running streams a grace window before force-close.
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := srv.Shutdown(shutdownCtx); err != nil {
+		logger.Warnf("Graceful shutdown timed out: %v", err)
+		_ = srv.Close()
+	}
+
+	if err := handler.Close(); err != nil {
+		logger.Warnf("Handler close: %v", err)
+	}
+	logger.Infof("Shutdown complete")
 }

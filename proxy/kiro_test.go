@@ -269,3 +269,13 @@ func awsEventStreamFrame(t *testing.T, eventType string, payload map[string]inte
 	frame = append(frame, 0, 0, 0, 0)
 	return frame
 }
+
+func TestBuildKiroTransportIdlePoolSizing(t *testing.T) {
+	tr := buildKiroTransport("")
+	if tr.MaxIdleConns != 1024 {
+		t.Fatalf("MaxIdleConns=%d want 1024", tr.MaxIdleConns)
+	}
+	if tr.MaxIdleConnsPerHost != 512 {
+		t.Fatalf("MaxIdleConnsPerHost=%d want 512", tr.MaxIdleConnsPerHost)
+	}
+}

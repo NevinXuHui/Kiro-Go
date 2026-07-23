@@ -118,7 +118,7 @@ func (p *AccountPool) GetNextExcluding(excluded map[string]bool) *config.Account
 		return acc
 	}
 
-		// 无可用账号，返回冷却时间最短的（排除额度用尽的，除非允许超额）
+	// 无可用账号，返回冷却时间最短的（排除额度用尽的，除非允许超额）
 	var best *config.Account
 	var earliest time.Time
 	for i := range p.accounts {
@@ -474,6 +474,7 @@ func (p *AccountPool) UpdateStats(id string, tokens int, credits float64) {
 				updated = true
 				continue
 			}
+			// 同步同一 ID 的副本（加权列表可能重复）
 			p.accounts[i].RequestCount = requestCount
 			p.accounts[i].ErrorCount = errorCount
 			p.accounts[i].TotalTokens = totalTokens
@@ -485,11 +486,7 @@ func (p *AccountPool) UpdateStats(id string, tokens int, credits float64) {
 			p.accounts[i].DailyDate = today
 		}
 	}
-	if updated {
-		go config.UpdateAccountStats(id, requestCount, errorCount, totalTokens, totalCredits, lastUsed)
-		// 更新每日统计，UpdateAccountDailyStats 会处理跨日期的情况
-		go config.UpdateAccountDailyStats(id, dailyRequests, dailyTokens, dailyCredits)
-	}
+	// 仅更新内存统计；持久化由后台 stats saver 批量 flush。
 }
 
 // GetAllAccounts 获取所有账号副本

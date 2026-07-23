@@ -50,3 +50,13 @@ func assertProxyURL(t *testing.T, got *url.URL, want string) {
 		t.Fatalf("expected proxy URL %q, got %q", want, got.String())
 	}
 }
+
+func TestBuildAuthTransportIdlePoolSizing(t *testing.T) {
+	tr := buildAuthTransport("")
+	if tr.MaxIdleConns != 256 {
+		t.Fatalf("MaxIdleConns=%d want 256", tr.MaxIdleConns)
+	}
+	if tr.MaxIdleConnsPerHost != 128 {
+		t.Fatalf("MaxIdleConnsPerHost=%d want 128", tr.MaxIdleConnsPerHost)
+	}
+}

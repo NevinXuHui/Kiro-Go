@@ -346,3 +346,91 @@ func TestAuthenticateRequiredWithoutKeysFailsClosed(t *testing.T) {
 		t.Fatalf("expected provided-key path to also fail closed when nothing is configured")
 	}
 }
+
+func TestInFlightLimiterHelpers(t *testing.T) {
+	h := &Handler{}
+	if !h.tryAcquireInFlight() {
+		t.Fatalf("nil limiter should allow")
+	}
+	h.releaseInFlight() // no panic
+
+	h.inFlight = make(chan struct{}, 1)
+	if !h.tryAcquireInFlight() {
+		t.Fatalf("first acquire should succeed")
+	}
+	if h.tryAcquireInFlight() {
+		t.Fatalf("second acquire should fail when full")
+	}
+	h.releaseInFlight()
+	if !h.tryAcquireInFlight() {
+		t.Fatalf("acquire after release should succeed")
+	}
+	h.releaseInFlight()
+}
+
+func TestInFlightLimitRejectsClaudeAndOpenAI(t *testing.T) {
+	mustInitConfig(t)
+	// Open access (no keys) so auth succeeds.
+	h := &Handler{inFlight: make(chan struct{}, 1)}
+	// Occupy the only slot.
+	h.inFlight <- struct{}{}
+
+	rec := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader("{}"))
+	h.ServeHTTP(rec, r)
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("claude expected 429, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), `"type":"error"`) && !strings.Contains(rec.Body.String(), `"type": "error"`) {
+		// json encoder may compact; check rate_limit_error
+	}
+	if !strings.Contains(rec.Body.String(), "rate_limit_error") {
+		t.Fatalf("expected claude rate_limit_error body=%s", rec.Body.String())
+	}
+
+	rec2 := httptest.NewRecorder()
+	r2 := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader("{}"))
+	h.ServeHTTP(rec2, r2)
+	if rec2.Code != http.StatusTooManyRequests {
+		t.Fatalf("openai expected 429, got %d body=%s", rec2.Code, rec2.Body.String())
+	}
+	if !strings.Contains(rec2.Body.String(), "rate_limit_error") {
+		t.Fatalf("expected openai rate_limit_error body=%s", rec2.Body.String())
+	}
+
+	rec3 := httptest.NewRecorder()
+	r3 := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader("{}"))
+	h.ServeHTTP(rec3, r3)
+	if rec3.Code != http.StatusTooManyRequests {
+		t.Fatalf("responses expected 429, got %d body=%s", rec3.Code, rec3.Body.String())
+	}
+}
+
+func TestInFlightLimitDoesNotThrottleHealth(t *testing.T) {
+	mustInitConfig(t)
+	h := &Handler{inFlight: make(chan struct{}, 1)}
+	h.inFlight <- struct{}{}
+	rec := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodGet, "/health", nil)
+	h.ServeHTTP(rec, r)
+	if rec.Code == http.StatusTooManyRequests {
+		t.Fatalf("health should not be limited, got 429")
+	}
+}
+
+func TestInFlightLimitInvalidKeyStill401(t *testing.T) {
+	mustInitConfig(t)
+	if _, err := config.AddApiKey(config.ApiKeyEntry{Name: "main", Key: "sk-good", Enabled: true}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	requireAuth(t)
+	h := &Handler{inFlight: make(chan struct{}, 1)}
+	h.inFlight <- struct{}{}
+	rec := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader("{}"))
+	// missing key
+	h.ServeHTTP(rec, r)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 before limiter, got %d body=%s", rec.Code, rec.Body.String())
+	}
+}

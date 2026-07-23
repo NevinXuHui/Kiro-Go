@@ -1,5 +1,5 @@
 {
-  "version": "1.1.1",
-  "changelog": "✨ Added and fixed several improvements across the project.\n✨ 新增并修复了一些内容，包含若干功能改进与问题修复。",
+  "version": "1.2.0",
+  "changelog": "🚀 提升 400 并发承载能力：请求热路径统计改为批量落盘、新增 in-flight 限流（默认 500）、调大 HTTP 连接池与 nofile 限制，并支持优雅退出。\n🚀 Improve 400-concurrency capacity: batch stats flush, in-flight limiter (default 500), larger HTTP idle pools & nofile limits, graceful shutdown.",
   "download": "https://github.com/Quorinex/Kiro-Go"
 }

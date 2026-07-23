@@ -13,6 +13,7 @@ package config
 import (
 	"crypto/rand"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"kiro-go/logger"
 	"os"
@@ -194,6 +195,12 @@ type Config struct {
 	// Defaults to 100; clamped to 1..200. Independent from BatchTestConcurrency.
 	ImportConcurrency int `json:"importConcurrency,omitempty"`
 
+	// MaxInFlightRequests limits concurrent heavy generation requests
+	// (/v1/messages, /v1/chat/completions, /v1/responses). Defaults to 500.
+	// Clamped to 1..10000. Protects the process under overload without
+	// blocking healthy 400-concurrency traffic.
+	MaxInFlightRequests int `json:"maxInFlightRequests,omitempty"`
+
 	// Proxy configuration: optional outbound proxy for Kiro API requests
 	// Format: "socks5://host:port", "socks5://user:pass@host:port",
 	//         "http://host:port",  "http://user:pass@host:port"
@@ -231,9 +238,9 @@ type Config struct {
 	TotalCredits    float64 `json:"totalCredits,omitempty"`    // Total credits consumed
 
 	// Daily statistics (reset at midnight)
-	DailyRequests        int    `json:"dailyRequests,omitempty"`        // Today's total requests
-	DailySuccessRequests int    `json:"dailySuccessRequests,omitempty"` // Today's successful requests
-	DailyFailedRequests  int    `json:"dailyFailedRequests,omitempty"`  // Today's failed requests
+	DailyRequests        int     `json:"dailyRequests,omitempty"`        // Today's total requests
+	DailySuccessRequests int     `json:"dailySuccessRequests,omitempty"` // Today's successful requests
+	DailyFailedRequests  int     `json:"dailyFailedRequests,omitempty"`  // Today's failed requests
 	DailyTokens          int     `json:"dailyTokens,omitempty"`          // Today's total tokens
 	DailyCredits         float64 `json:"dailyCredits,omitempty"`         // Today's total credits consumed
 	DailyDate            string  `json:"dailyDate,omitempty"`            // Current date in YYYY-MM-DD format
@@ -260,7 +267,7 @@ type AccountInfo struct {
 }
 
 // Version current version
-const Version = "1.1.1"
+const Version = "1.2.0"
 
 var (
 	cfg     *Config
@@ -678,6 +685,83 @@ func UpdateDailyStats(dailyReq, dailySuccess, dailyFailed, dailyTokens int, dail
 	return Save()
 }
 
+// AccountRuntimeStats is a minimal stats snapshot for bulk flush.
+// Only statistics fields are applied; auth/proxy/overage config is never overwritten.
+type AccountRuntimeStats struct {
+	ID            string
+	RequestCount  int
+	ErrorCount    int
+	LastUsed      int64
+	TotalTokens   int
+	TotalCredits  float64
+	DailyRequests int
+	DailyTokens   int
+	DailyCredits  float64
+	DailyDate     string
+}
+
+// UpdateRuntimeStatsSnapshot updates global, daily, and per-account statistics
+// in one lock and one Save(). Account non-stats fields are preserved.
+func UpdateRuntimeStatsSnapshot(
+	totalReq, successReq, failedReq, totalTokens int, totalCredits float64,
+	dailyReq, dailySuccess, dailyFailed, dailyTokens int, dailyCredits float64, dailyDate string,
+	accounts []AccountRuntimeStats,
+) error {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	if cfg == nil {
+		return errors.New("config not initialized")
+	}
+
+	cfg.TotalRequests = totalReq
+	cfg.SuccessRequests = successReq
+	cfg.FailedRequests = failedReq
+	cfg.TotalTokens = totalTokens
+	cfg.TotalCredits = totalCredits
+
+	today := time.Now().Format("2006-01-02")
+	if dailyDate == "" {
+		dailyDate = today
+	}
+	if cfg.DailyDate != dailyDate {
+		logger.Infof("[DailyStats] Day changed from %s to %s, writing runtime snapshot: requests=%d success=%d failed=%d tokens=%d credits=%.4f",
+			cfg.DailyDate, dailyDate, dailyReq, dailySuccess, dailyFailed, dailyTokens, dailyCredits)
+	}
+	cfg.DailyDate = dailyDate
+	cfg.DailyRequests = dailyReq
+	cfg.DailySuccessRequests = dailySuccess
+	cfg.DailyFailedRequests = dailyFailed
+	cfg.DailyTokens = dailyTokens
+	cfg.DailyCredits = dailyCredits
+
+	if len(accounts) > 0 {
+		byID := make(map[string]AccountRuntimeStats, len(accounts))
+		for _, a := range accounts {
+			if a.ID == "" {
+				continue
+			}
+			byID[a.ID] = a
+		}
+		for i := range cfg.Accounts {
+			snap, ok := byID[cfg.Accounts[i].ID]
+			if !ok {
+				continue
+			}
+			cfg.Accounts[i].RequestCount = snap.RequestCount
+			cfg.Accounts[i].ErrorCount = snap.ErrorCount
+			cfg.Accounts[i].LastUsed = snap.LastUsed
+			cfg.Accounts[i].TotalTokens = snap.TotalTokens
+			cfg.Accounts[i].TotalCredits = snap.TotalCredits
+			cfg.Accounts[i].DailyRequests = snap.DailyRequests
+			cfg.Accounts[i].DailyTokens = snap.DailyTokens
+			cfg.Accounts[i].DailyCredits = snap.DailyCredits
+			cfg.Accounts[i].DailyDate = snap.DailyDate
+		}
+	}
+
+	return saveLocked()
+}
+
 // GetDailyStats returns daily statistics (requests, success, failed, tokens, credits, date).
 // If the stored date is not today, returns zeros with today's date so callers
 // initialize memory for a fresh day without carrying over yesterday's totals.
@@ -1069,7 +1153,42 @@ func UpdateShowExhaustedAccounts(show bool) error {
 	return Save()
 }
 
-// GetBatchTestConcurrency returns admin batch-test concurrency (default 5, range 1..200).
+// GetMaxInFlightRequests returns the max concurrent heavy generation requests.
+// Default 500 (covers 400 concurrency with headroom). Clamped to 1..10000.
+func GetMaxInFlightRequests() int {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	n := 500
+	if cfg != nil && cfg.MaxInFlightRequests > 0 {
+		n = cfg.MaxInFlightRequests
+	}
+	if n < 1 {
+		n = 1
+	}
+	if n > 10000 {
+		n = 10000
+	}
+	return n
+}
+
+// UpdateMaxInFlightRequests sets max concurrent generation requests and persists.
+func UpdateMaxInFlightRequests(n int) error {
+	if n < 1 {
+		n = 1
+	}
+	if n > 10000 {
+		n = 10000
+	}
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	if cfg == nil {
+		return errors.New("config not initialized")
+	}
+	cfg.MaxInFlightRequests = n
+	return Save()
+}
+
+// GetBatchTestConcurrency returns admin batch-test concurrency (default 5, clamp 1..200).
 func GetBatchTestConcurrency() int {
 	cfgLock.RLock()
 	defer cfgLock.RUnlock()

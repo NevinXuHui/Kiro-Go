@@ -1,6 +1,8 @@
 package pool
 
 import (
+	"os"
+
 	"errors"
 	"kiro-go/config"
 	"path/filepath"
@@ -323,5 +325,50 @@ func TestReloadDropsOverQuotaAccountWhenAllowOverUsageDisabled(t *testing.T) {
 
 	if got := p.GetNext(); got != nil {
 		t.Fatalf("expected over-quota account to be dropped, got %q", got.ID)
+	}
+}
+
+func TestUpdateStatsMemoryOnlyNoImmediatePersist(t *testing.T) {
+	cfgFile := filepath.Join(t.TempDir(), "config.json")
+	if err := config.Init(cfgFile); err != nil {
+		t.Fatalf("config.Init: %v", err)
+	}
+	if err := config.AddAccount(config.Account{ID: "acc-stats", Enabled: true, AccessToken: "tok"}); err != nil {
+		t.Fatalf("AddAccount: %v", err)
+	}
+
+	p := &AccountPool{
+		accounts: []config.Account{
+			{ID: "acc-stats", Enabled: true, AccessToken: "tok"},
+			// weighted duplicate copy
+			{ID: "acc-stats", Enabled: true, AccessToken: "tok"},
+		},
+		cooldowns:   make(map[string]time.Time),
+		errorCounts: make(map[string]int),
+		modelLists:  make(map[string]map[string]bool),
+	}
+
+	before, err := os.Stat(cfgFile)
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+	time.Sleep(20 * time.Millisecond)
+
+	p.UpdateStats("acc-stats", 15, 0.5)
+	p.UpdateStats("acc-stats", 5, 0.25)
+
+	// Both copies in weighted list should stay in sync.
+	for i, a := range p.accounts {
+		if a.RequestCount != 2 || a.TotalTokens != 20 {
+			t.Fatalf("account[%d] stats mismatch: %+v", i, a)
+		}
+	}
+
+	after, err := os.Stat(cfgFile)
+	if err != nil {
+		t.Fatalf("stat after: %v", err)
+	}
+	if after.ModTime().After(before.ModTime()) {
+		t.Fatalf("UpdateStats should not persist config immediately")
 	}
 }

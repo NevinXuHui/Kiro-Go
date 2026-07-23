@@ -7,6 +7,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 func TestApiKeyMigrationFromLegacyField(t *testing.T) {
@@ -244,10 +245,10 @@ func TestResetApiKeyUsage(t *testing.T) {
 
 func TestApiKeyOverLimit(t *testing.T) {
 	tests := []struct {
-		name        string
-		entry       ApiKeyEntry
-		wantToken   bool
-		wantCredit  bool
+		name       string
+		entry      ApiKeyEntry
+		wantToken  bool
+		wantCredit bool
 	}{
 		{"unlimited", ApiKeyEntry{TokensUsed: 100, CreditsUsed: 5}, false, false},
 		{"under token limit", ApiKeyEntry{TokenLimit: 200, TokensUsed: 100}, false, false},
@@ -291,5 +292,93 @@ func TestGenerateApiKeyValueIsUnique(t *testing.T) {
 	}
 	if len(a) < 10 {
 		t.Fatalf("expected non-trivial key length, got %q", a)
+	}
+}
+
+func TestRecordApiKeyUsageDeferredDoesNotPersistImmediately(t *testing.T) {
+	cfgFile := filepath.Join(t.TempDir(), "config.json")
+	if err := Init(cfgFile); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	created, err := AddApiKey(ApiKeyEntry{Name: "deferred", Key: "sk-deferred", Enabled: true})
+	if err != nil {
+		t.Fatalf("add: %v", err)
+	}
+
+	before, err := os.Stat(cfgFile)
+	if err != nil {
+		t.Fatalf("stat before: %v", err)
+	}
+	// Ensure mtime resolution has room to change if a write happens.
+	time.Sleep(20 * time.Millisecond)
+
+	if err := RecordApiKeyUsageDeferred(created.ID, 42, 1.5); err != nil {
+		t.Fatalf("deferred: %v", err)
+	}
+	got := GetApiKeyEntry(created.ID)
+	if got == nil {
+		t.Fatalf("entry missing")
+	}
+	if got.TokensUsed != 42 || got.CreditsUsed != 1.5 || got.RequestsCount != 1 {
+		t.Fatalf("memory counters mismatch: %+v", got)
+	}
+
+	after, err := os.Stat(cfgFile)
+	if err != nil {
+		t.Fatalf("stat after: %v", err)
+	}
+	if after.ModTime().After(before.ModTime()) {
+		t.Fatalf("expected deferred usage to avoid immediate save")
+	}
+
+	// Flush via runtime snapshot should persist api key memory state.
+	if err := UpdateRuntimeStatsSnapshot(1, 1, 0, 42, 1.5, 1, 1, 0, 42, 1.5, time.Now().Format("2006-01-02"), nil); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+	// Reload from disk
+	if err := Load(); err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	reloaded := GetApiKeyEntry(created.ID)
+	if reloaded == nil || reloaded.TokensUsed != 42 {
+		t.Fatalf("expected persisted usage after flush, got %+v", reloaded)
+	}
+}
+
+func TestRecordApiKeyUsageDeferredConcurrent(t *testing.T) {
+	cfgFile := filepath.Join(t.TempDir(), "config.json")
+	if err := Init(cfgFile); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	created, err := AddApiKey(ApiKeyEntry{Name: "race-d", Key: "sk-race-d", Enabled: true})
+	if err != nil {
+		t.Fatalf("add: %v", err)
+	}
+	const goroutines = 16
+	const perGoroutine = 25
+	var wg sync.WaitGroup
+	wg.Add(goroutines)
+	var failures int32
+	for g := 0; g < goroutines; g++ {
+		go func() {
+			defer wg.Done()
+			for i := 0; i < perGoroutine; i++ {
+				if err := RecordApiKeyUsageDeferred(created.ID, 3, 0.25); err != nil {
+					atomic.AddInt32(&failures, 1)
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	if failures != 0 {
+		t.Fatalf("deferred concurrent failures: %d", failures)
+	}
+	got := GetApiKeyEntry(created.ID)
+	wantTokens := int64(goroutines * perGoroutine * 3)
+	wantCredits := float64(goroutines*perGoroutine) * 0.25
+	wantReq := int64(goroutines * perGoroutine)
+	if got.TokensUsed != wantTokens || got.CreditsUsed != wantCredits || got.RequestsCount != wantReq {
+		t.Fatalf("counters mismatch got tokens=%d credits=%v req=%d", got.TokensUsed, got.CreditsUsed, got.RequestsCount)
 	}
 }

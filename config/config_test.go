@@ -127,3 +127,94 @@ func TestAccountAllowOverageMigration(t *testing.T) {
 		}
 	}
 }
+
+func TestGetMaxInFlightRequestsDefaultAndClamp(t *testing.T) {
+	if err := Init(filepath.Join(t.TempDir(), "config.json")); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	if got := GetMaxInFlightRequests(); got != 500 {
+		t.Fatalf("default MaxInFlightRequests = %d, want 500", got)
+	}
+	if err := UpdateMaxInFlightRequests(400); err != nil {
+		t.Fatalf("update 400: %v", err)
+	}
+	if got := GetMaxInFlightRequests(); got != 400 {
+		t.Fatalf("got %d, want 400", got)
+	}
+	if err := UpdateMaxInFlightRequests(0); err != nil {
+		t.Fatalf("update 0: %v", err)
+	}
+	if got := GetMaxInFlightRequests(); got != 1 {
+		t.Fatalf("clamp low got %d, want 1", got)
+	}
+	if err := UpdateMaxInFlightRequests(20000); err != nil {
+		t.Fatalf("update 20000: %v", err)
+	}
+	if got := GetMaxInFlightRequests(); got != 10000 {
+		t.Fatalf("clamp high got %d, want 10000", got)
+	}
+}
+
+func TestUpdateRuntimeStatsSnapshotPreservesNonStatsFields(t *testing.T) {
+	cfgFile := filepath.Join(t.TempDir(), "config.json")
+	if err := Init(cfgFile); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	if err := AddAccount(Account{
+		ID:           "acc-1",
+		Enabled:      true,
+		AccessToken:  "secret-token",
+		ProxyURL:     "socks5://127.0.0.1:1080",
+		RequestCount: 1,
+		TotalTokens:  10,
+	}); err != nil {
+		t.Fatalf("add account: %v", err)
+	}
+
+	today := "2026-07-23"
+	err := UpdateRuntimeStatsSnapshot(
+		100, 90, 10, 1000, 12.5,
+		20, 18, 2, 200, 3.5, today,
+		[]AccountRuntimeStats{{
+			ID:            "acc-1",
+			RequestCount:  5,
+			ErrorCount:    1,
+			LastUsed:      123456,
+			TotalTokens:   99,
+			TotalCredits:  1.25,
+			DailyRequests: 2,
+			DailyTokens:   30,
+			DailyCredits:  0.5,
+			DailyDate:     today,
+		}},
+	)
+	if err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+
+	accounts := GetAccounts()
+	if len(accounts) != 1 {
+		t.Fatalf("expected 1 account, got %d", len(accounts))
+	}
+	a := accounts[0]
+	if a.AccessToken != "secret-token" {
+		t.Fatalf("AccessToken overwritten: %q", a.AccessToken)
+	}
+	if a.ProxyURL != "socks5://127.0.0.1:1080" {
+		t.Fatalf("ProxyURL overwritten: %q", a.ProxyURL)
+	}
+	if !a.Enabled {
+		t.Fatalf("Enabled overwritten")
+	}
+	if a.RequestCount != 5 || a.TotalTokens != 99 || a.ErrorCount != 1 {
+		t.Fatalf("stats not applied: %+v", a)
+	}
+	totalReq, successReq, failedReq, totalTokens, totalCredits := GetStats()
+	if totalReq != 100 || successReq != 90 || failedReq != 10 || totalTokens != 1000 || totalCredits != 12.5 {
+		t.Fatalf("global stats mismatch: %d %d %d %d %v", totalReq, successReq, failedReq, totalTokens, totalCredits)
+	}
+	dReq, dSucc, dFail, dTok, dCred, dDate := GetDailyStats()
+	if dReq != 20 || dSucc != 18 || dFail != 2 || dTok != 200 || dCred != 3.5 || dDate != today {
+		t.Fatalf("daily stats mismatch: %d %d %d %d %v %s", dReq, dSucc, dFail, dTok, dCred, dDate)
+	}
+}

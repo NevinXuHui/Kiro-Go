@@ -21,16 +21,16 @@ const tokenRefreshSkewSeconds int64 = 120
 
 // RequestLog stores details about a single API request (success or failure).
 type RequestLog struct {
-	Time      int64  `json:"time"`      // Unix timestamp
-	Endpoint  string `json:"endpoint"`  // claude/openai/responses
-	Model     string `json:"model"`     // Requested model
-	AccountID string `json:"accountId"` // Account used
-	Status    string `json:"status"`    // "success" or "error"
-	Error     string `json:"error"`     // Error message (empty on success)
-	ErrorType string `json:"errorType"` // Error category (empty on success)
-	Tokens    int    `json:"tokens"`    // Total tokens (input+output, 0 on failure)
-	Credits   float64 `json:"credits"`  // Credits consumed (0 on failure)
-	Duration  int64  `json:"duration"`  // Request duration in ms
+	Time      int64   `json:"time"`      // Unix timestamp
+	Endpoint  string  `json:"endpoint"`  // claude/openai/responses
+	Model     string  `json:"model"`     // Requested model
+	AccountID string  `json:"accountId"` // Account used
+	Status    string  `json:"status"`    // "success" or "error"
+	Error     string  `json:"error"`     // Error message (empty on success)
+	ErrorType string  `json:"errorType"` // Error category (empty on success)
+	Tokens    int     `json:"tokens"`    // Total tokens (input+output, 0 on failure)
+	Credits   float64 `json:"credits"`   // Credits consumed (0 on failure)
+	Duration  int64   `json:"duration"`  // Request duration in ms
 }
 
 const requestLogsMaxSize = 500
@@ -65,6 +65,11 @@ type Handler struct {
 	// 请求日志 (环形缓冲区，包含成功和失败)
 	requestLogs   []RequestLog
 	requestLogsMu sync.RWMutex
+	// 全局 in-flight 限流：仅保护重型生成 API；nil 表示不限流（测试零值兼容）
+	inFlight chan struct{}
+	// 后台任务生命周期
+	closeOnce sync.Once
+	wg        sync.WaitGroup
 }
 
 type thinkingStreamSource int
@@ -255,22 +260,80 @@ func NewHandler() *Handler {
 		dailyTokens:          int64(dailyTokens),
 		dailyCredits:         dailyCredits,
 		dailyDate:            dailyDate,
-		startTime:       time.Now().Unix(),
-		stopRefresh:     make(chan struct{}),
-		stopStatsSaver:  make(chan struct{}),
-		promptCache:     newPromptCacheTracker(defaultPromptCacheTTL),
+		startTime:            time.Now().Unix(),
+		stopRefresh:          make(chan struct{}),
+		stopStatsSaver:       make(chan struct{}),
+		promptCache:          newPromptCacheTracker(defaultPromptCacheTTL),
+		inFlight:             make(chan struct{}, config.GetMaxInFlightRequests()),
 	}
 	// 启动时对齐跨日：若磁盘日期已是今天但内存基数来自旧日，ensure 会在后续请求中滚动
 	h.ensureDailyCounters()
 	// 启动后台刷新
-	go h.backgroundRefresh()
+	h.wg.Add(1)
+	go func() {
+		defer h.wg.Done()
+		h.backgroundRefresh()
+	}()
 	// 启动后台统计保存 (每30秒保存一次)
-	go h.backgroundStatsSaver()
+	h.wg.Add(1)
+	go func() {
+		defer h.wg.Done()
+		h.backgroundStatsSaver()
+	}()
 	// 启动后台每日重置检查
-	go h.backgroundDailyReset()
+	h.wg.Add(1)
+	go func() {
+		defer h.wg.Done()
+		h.backgroundDailyReset()
+	}()
 	// 清理过期的 stored responses（>30 天）
 	go purgeExpiredResponses(responsesDefaultTTL)
 	return h
+}
+
+// tryAcquireInFlight tries to reserve one in-flight slot without blocking.
+// nil channel (zero-value Handler in tests) always succeeds.
+func (h *Handler) tryAcquireInFlight() bool {
+	if h == nil || h.inFlight == nil {
+		return true
+	}
+	select {
+	case h.inFlight <- struct{}{}:
+		return true
+	default:
+		return false
+	}
+}
+
+// releaseInFlight releases one in-flight slot.
+func (h *Handler) releaseInFlight() {
+	if h == nil || h.inFlight == nil {
+		return
+	}
+	select {
+	case <-h.inFlight:
+	default:
+	}
+}
+
+// Close stops background workers and flushes runtime stats. Safe to call multiple times.
+func (h *Handler) Close() error {
+	if h == nil {
+		return nil
+	}
+	h.closeOnce.Do(func() {
+		// Signal background loops. stopRefresh is shared by refresh + daily reset.
+		if h.stopStatsSaver != nil {
+			close(h.stopStatsSaver)
+		}
+		if h.stopRefresh != nil {
+			close(h.stopRefresh)
+		}
+		h.wg.Wait()
+		// Extra safety flush in case stats saver was never started (tests).
+		h.saveStats()
+	})
+	return nil
 }
 
 // backgroundRefresh 后台定时刷新账户信息
@@ -278,10 +341,14 @@ func (h *Handler) backgroundRefresh() {
 	ticker := time.NewTicker(30 * time.Minute) // 每 30 分钟刷新一次
 	defer ticker.Stop()
 
-	// 启动时延迟 10 秒后执行一次
-	time.Sleep(10 * time.Second)
-	h.refreshModelsCache()
-	h.refreshAllAccounts()
+	// 启动时延迟 10 秒后执行一次；可被 stop 打断，避免 Close 卡 10s
+	select {
+	case <-time.After(10 * time.Second):
+		h.refreshModelsCache()
+		h.refreshAllAccounts()
+	case <-h.stopRefresh:
+		return
+	}
 
 	for {
 		select {
@@ -398,6 +465,11 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if ar == nil {
 			return
 		}
+		if !h.tryAcquireInFlight() {
+			h.sendClaudeError(w, http.StatusTooManyRequests, "rate_limit_error", "Too many in-flight requests")
+			return
+		}
+		defer h.releaseInFlight()
 		h.handleClaudeMessages(w, ar)
 	case path == "/v1/messages/count_tokens" || path == "/messages/count_tokens":
 		ar := h.authenticateForClaude(w, r)
@@ -410,12 +482,22 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if ar == nil {
 			return
 		}
+		if !h.tryAcquireInFlight() {
+			h.sendOpenAIError(w, http.StatusTooManyRequests, "rate_limit_error", "Too many in-flight requests")
+			return
+		}
+		defer h.releaseInFlight()
 		h.handleOpenAIChat(w, ar)
 	case path == "/v1/responses" || path == "/responses":
 		ar := h.authenticateForOpenAI(w, r)
 		if ar == nil {
 			return
 		}
+		if !h.tryAcquireInFlight() {
+			h.sendOpenAIError(w, http.StatusTooManyRequests, "rate_limit_error", "Too many in-flight requests")
+			return
+		}
+		defer h.releaseInFlight()
 		h.handleOpenAIResponses(w, ar)
 	case path == "/v1/models" || path == "/models":
 		h.handleModels(w, r)
@@ -466,15 +548,15 @@ func (h *Handler) handleStats(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	h.ensureDailyCounters()
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"status":          "ok",
-		"version":         config.Version,
-		"accounts":        h.pool.Count(),
-		"available":       h.pool.AvailableCount(),
-		"totalRequests":   atomic.LoadInt64(&h.totalRequests),
-		"successRequests": atomic.LoadInt64(&h.successRequests),
-		"failedRequests":  atomic.LoadInt64(&h.failedRequests),
-		"totalTokens":     atomic.LoadInt64(&h.totalTokens),
-		"totalCredits":    h.getCredits(),
+		"status":               "ok",
+		"version":              config.Version,
+		"accounts":             h.pool.Count(),
+		"available":            h.pool.AvailableCount(),
+		"totalRequests":        atomic.LoadInt64(&h.totalRequests),
+		"successRequests":      atomic.LoadInt64(&h.successRequests),
+		"failedRequests":       atomic.LoadInt64(&h.failedRequests),
+		"totalTokens":          atomic.LoadInt64(&h.totalTokens),
+		"totalCredits":         h.getCredits(),
 		"dailyRequests":        atomic.LoadInt64(&h.dailyRequests),
 		"dailySuccessRequests": atomic.LoadInt64(&h.dailySuccessRequests),
 		"dailyFailedRequests":  atomic.LoadInt64(&h.dailyFailedRequests),
@@ -1396,23 +1478,59 @@ func (h *Handler) getDailyCredits() float64 {
 
 // saveStats 保存统计到配置文件
 func (h *Handler) saveStats() {
-	config.UpdateStats(
+	// 跨日时先滚动内存计数，再把「当日」值写入配置
+	h.ensureDailyCounters()
+	dailyCredits := h.getDailyCredits()
+
+	var accountStats []config.AccountRuntimeStats
+	if h.pool != nil {
+		accounts := h.pool.GetAllAccounts()
+		// 加权列表可能含重复 ID，按 ID 去重保留最新内存快照
+		seen := make(map[string]struct{}, len(accounts))
+		accountStats = make([]config.AccountRuntimeStats, 0, len(accounts))
+		for _, a := range accounts {
+			if a.ID == "" {
+				continue
+			}
+			if _, ok := seen[a.ID]; ok {
+				continue
+			}
+			seen[a.ID] = struct{}{}
+			accountStats = append(accountStats, config.AccountRuntimeStats{
+				ID:            a.ID,
+				RequestCount:  a.RequestCount,
+				ErrorCount:    a.ErrorCount,
+				LastUsed:      a.LastUsed,
+				TotalTokens:   a.TotalTokens,
+				TotalCredits:  a.TotalCredits,
+				DailyRequests: a.DailyRequests,
+				DailyTokens:   a.DailyTokens,
+				DailyCredits:  a.DailyCredits,
+				DailyDate:     a.DailyDate,
+			})
+		}
+	}
+
+	h.dailyMu.Lock()
+	dailyDate := h.dailyDate
+	h.dailyMu.Unlock()
+
+	if err := config.UpdateRuntimeStatsSnapshot(
 		int(atomic.LoadInt64(&h.totalRequests)),
 		int(atomic.LoadInt64(&h.successRequests)),
 		int(atomic.LoadInt64(&h.failedRequests)),
 		int(atomic.LoadInt64(&h.totalTokens)),
 		h.getCredits(),
-	)
-	// 跨日时先滚动内存计数，再把「当日」值写入配置
-	h.ensureDailyCounters()
-	dailyCredits := h.getDailyCredits()
-	config.UpdateDailyStats(
 		int(atomic.LoadInt64(&h.dailyRequests)),
 		int(atomic.LoadInt64(&h.dailySuccessRequests)),
 		int(atomic.LoadInt64(&h.dailyFailedRequests)),
 		int(atomic.LoadInt64(&h.dailyTokens)),
 		dailyCredits,
-	)
+		dailyDate,
+		accountStats,
+	); err != nil {
+		logger.Warnf("[Stats] failed to persist runtime stats: %v", err)
+	}
 }
 
 // backgroundDailyReset 后台定期滚动并落盘每日统计
@@ -1423,16 +1541,9 @@ func (h *Handler) backgroundDailyReset() {
 	for {
 		select {
 		case <-ticker.C:
-			// 滚动内存 + 落盘；跨日时 ensureDailyCounters 会清零并记录日志
+			// 滚动内存后走统一 runtime flush，避免单独全量 Save
 			h.ensureDailyCounters()
-			req := int(atomic.LoadInt64(&h.dailyRequests))
-			succ := int(atomic.LoadInt64(&h.dailySuccessRequests))
-			fail := int(atomic.LoadInt64(&h.dailyFailedRequests))
-			tok := int(atomic.LoadInt64(&h.dailyTokens))
-			cr := h.getDailyCredits()
-			if err := config.UpdateDailyStats(req, succ, fail, tok, cr); err != nil {
-				logger.Warnf("[DailyReset] failed to persist daily stats: %v", err)
-			}
+			h.saveStats()
 		case <-h.stopRefresh:
 			return
 		}
@@ -1471,7 +1582,8 @@ func (h *Handler) recordSuccessForApiKey(apiKeyID string, inputTokens, outputTok
 	if apiKeyID == "" {
 		return
 	}
-	if err := config.RecordApiKeyUsage(apiKeyID, int64(inputTokens+outputTokens), credits); err != nil {
+	// Deferred persistence: counters update in memory; background saver flushes config.
+	if err := config.RecordApiKeyUsageDeferred(apiKeyID, int64(inputTokens+outputTokens), credits); err != nil {
 		logger.Warnf("[ApiKey] failed to record usage for key %s: %v", apiKeyID, err)
 	}
 }
@@ -3118,7 +3230,7 @@ func (h *Handler) apiImportCredentials(w http.ResponseWriter, r *http.Request) {
 	for _, existing := range existingAccounts {
 		// 如果 email 相同或 refreshToken 相同，认为是重复账号
 		if (email != "" && existing.Email == email) ||
-		   (req.RefreshToken != "" && existing.RefreshToken == req.RefreshToken) {
+			(req.RefreshToken != "" && existing.RefreshToken == req.RefreshToken) {
 			w.WriteHeader(200)
 			json.NewEncoder(w).Encode(map[string]interface{}{
 				"success":   true,
@@ -3168,14 +3280,14 @@ func (h *Handler) apiImportCredentials(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) apiGetStatus(w http.ResponseWriter, r *http.Request) {
 	h.ensureDailyCounters()
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"version":         config.Version,
-		"accounts":        h.pool.Count(),
-		"available":       h.pool.AvailableCount(),
-		"totalRequests":   atomic.LoadInt64(&h.totalRequests),
-		"successRequests": atomic.LoadInt64(&h.successRequests),
-		"failedRequests":  atomic.LoadInt64(&h.failedRequests),
-		"totalTokens":     atomic.LoadInt64(&h.totalTokens),
-		"totalCredits":    h.getCredits(),
+		"version":              config.Version,
+		"accounts":             h.pool.Count(),
+		"available":            h.pool.AvailableCount(),
+		"totalRequests":        atomic.LoadInt64(&h.totalRequests),
+		"successRequests":      atomic.LoadInt64(&h.successRequests),
+		"failedRequests":       atomic.LoadInt64(&h.failedRequests),
+		"totalTokens":          atomic.LoadInt64(&h.totalTokens),
+		"totalCredits":         h.getCredits(),
 		"dailyRequests":        atomic.LoadInt64(&h.dailyRequests),
 		"dailySuccessRequests": atomic.LoadInt64(&h.dailySuccessRequests),
 		"dailyFailedRequests":  atomic.LoadInt64(&h.dailyFailedRequests),
