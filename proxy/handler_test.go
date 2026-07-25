@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"fmt"
 	"encoding/json"
 	"kiro-go/config"
 	accountpool "kiro-go/pool"
@@ -478,5 +479,40 @@ func TestBuildAnthropicModelsResponseGeneratesThinkingVariants(t *testing.T) {
 	}
 	if supportsImage, ok := models[0]["supports_image"].(bool); !ok || !supportsImage {
 		t.Fatalf("expected image capability to be preserved, got %#v", models[0]["supports_image"])
+	}
+}
+
+
+func TestResolveRequestLogsMaxSize(t *testing.T) {
+	t.Setenv("REQUEST_LOGS_MAX", "")
+	if got := resolveRequestLogsMaxSize(); got != defaultRequestLogsMaxSize {
+		t.Fatalf("default=%d want %d", got, defaultRequestLogsMaxSize)
+	}
+	t.Setenv("REQUEST_LOGS_MAX", "2500")
+	if got := resolveRequestLogsMaxSize(); got != 2500 {
+		t.Fatalf("custom=%d want 2500", got)
+	}
+	t.Setenv("REQUEST_LOGS_MAX", "1")
+	if got := resolveRequestLogsMaxSize(); got != minRequestLogsMaxSize {
+		t.Fatalf("min clamp=%d want %d", got, minRequestLogsMaxSize)
+	}
+	t.Setenv("REQUEST_LOGS_MAX", "9999999")
+	if got := resolveRequestLogsMaxSize(); got != maxRequestLogsMaxSize {
+		t.Fatalf("max clamp=%d want %d", got, maxRequestLogsMaxSize)
+	}
+}
+
+func TestAppendRequestLogRespectsCapacity(t *testing.T) {
+	h := &Handler{requestLogsMaxSize: 3}
+	for i := 0; i < 5; i++ {
+		h.appendRequestLog(RequestLog{Model: fmt.Sprintf("m%d", i), Status: "success"})
+	}
+	logs := h.getRequestLogs()
+	if len(logs) != 3 {
+		t.Fatalf("len=%d want 3", len(logs))
+	}
+	// newest first
+	if logs[0].Model != "m4" || logs[2].Model != "m2" {
+		t.Fatalf("unexpected order: %+v", logs)
 	}
 }

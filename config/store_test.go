@@ -143,3 +143,43 @@ func TestSQLiteAccountCRUDAndStats(t *testing.T) {
 		t.Fatalf("expected empty accounts after delete")
 	}
 }
+
+
+func TestRequestLogsPersistAndPrune(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.json")
+	if err := Init(path); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	t.Cleanup(CloseStore)
+
+	entries := []RequestLogEntry{
+		{Time: 1, Endpoint: "claude", Model: "m1", AccountEmail: "a@x.com", Status: "error", Error: "e1"},
+		{Time: 2, Endpoint: "claude", Model: "m2", AccountEmail: "b@x.com", Status: "success", Tokens: 10},
+		{Time: 3, Endpoint: "openai", Model: "m3", AccountEmail: "c@x.com", Status: "error", Error: "e3"},
+	}
+	if err := InsertRequestLogs(entries, 2); err != nil {
+		t.Fatalf("Insert: %v", err)
+	}
+	got, err := ListRequestLogs(10)
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("len=%d want 2 (pruned)", len(got))
+	}
+	// newest first
+	if got[0].Model != "m3" || got[1].Model != "m2" {
+		t.Fatalf("unexpected order: %+v", got)
+	}
+	if err := ClearRequestLogs(); err != nil {
+		t.Fatalf("Clear: %v", err)
+	}
+	got, err = ListRequestLogs(10)
+	if err != nil {
+		t.Fatalf("List2: %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("after clear len=%d", len(got))
+	}
+}

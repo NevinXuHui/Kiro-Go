@@ -348,13 +348,18 @@ func TestAuthenticateRequiredWithoutKeysFailsClosed(t *testing.T) {
 }
 
 func TestInFlightLimiterHelpers(t *testing.T) {
+	mustInitConfig(t)
 	h := &Handler{}
 	if !h.tryAcquireInFlight() {
 		t.Fatalf("nil limiter should allow")
 	}
 	h.releaseInFlight() // no panic
 
-	h.inFlight = make(chan struct{}, 1)
+	h.inFlightLimitOn = true
+	// Pin limit to 1 for the test via config.
+	if err := config.UpdateMaxInFlightRequests(1); err != nil {
+		t.Fatalf("set max in-flight: %v", err)
+	}
 	if !h.tryAcquireInFlight() {
 		t.Fatalf("first acquire should succeed")
 	}
@@ -371,9 +376,14 @@ func TestInFlightLimiterHelpers(t *testing.T) {
 func TestInFlightLimitRejectsClaudeAndOpenAI(t *testing.T) {
 	mustInitConfig(t)
 	// Open access (no keys) so auth succeeds.
-	h := &Handler{inFlight: make(chan struct{}, 1)}
+	h := &Handler{inFlightLimitOn: true}
+	if err := config.UpdateMaxInFlightRequests(1); err != nil {
+		t.Fatalf("set max in-flight: %v", err)
+	}
 	// Occupy the only slot.
-	h.inFlight <- struct{}{}
+	if !h.tryAcquireInFlight() {
+		t.Fatalf("seed acquire failed")
+	}
 
 	rec := httptest.NewRecorder()
 	r := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader("{}"))
@@ -408,8 +418,13 @@ func TestInFlightLimitRejectsClaudeAndOpenAI(t *testing.T) {
 
 func TestInFlightLimitDoesNotThrottleHealth(t *testing.T) {
 	mustInitConfig(t)
-	h := &Handler{inFlight: make(chan struct{}, 1)}
-	h.inFlight <- struct{}{}
+	h := &Handler{inFlightLimitOn: true}
+	if err := config.UpdateMaxInFlightRequests(1); err != nil {
+		t.Fatalf("set max in-flight: %v", err)
+	}
+	if !h.tryAcquireInFlight() {
+		t.Fatalf("seed acquire failed")
+	}
 	rec := httptest.NewRecorder()
 	r := httptest.NewRequest(http.MethodGet, "/health", nil)
 	h.ServeHTTP(rec, r)
@@ -424,8 +439,13 @@ func TestInFlightLimitInvalidKeyStill401(t *testing.T) {
 		t.Fatalf("seed: %v", err)
 	}
 	requireAuth(t)
-	h := &Handler{inFlight: make(chan struct{}, 1)}
-	h.inFlight <- struct{}{}
+	h := &Handler{inFlightLimitOn: true}
+	if err := config.UpdateMaxInFlightRequests(1); err != nil {
+		t.Fatalf("set max in-flight: %v", err)
+	}
+	if !h.tryAcquireInFlight() {
+		t.Fatalf("seed acquire failed")
+	}
 	rec := httptest.NewRecorder()
 	r := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader("{}"))
 	// missing key

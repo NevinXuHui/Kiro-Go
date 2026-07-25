@@ -197,9 +197,10 @@ type Config struct {
 	ImportConcurrency int `json:"importConcurrency,omitempty"`
 
 	// MaxInFlightRequests limits concurrent heavy generation requests
-	// (/v1/messages, /v1/chat/completions, /v1/responses). Defaults to 500.
-	// Clamped to 1..10000. Protects the process under overload without
-	// blocking healthy 400-concurrency traffic.
+	// (/v1/messages, /v1/chat/completions, /v1/responses). Defaults to 4500.
+	// Clamped to 1..20000. Protects the process under overload without
+	// blocking healthy multi-thousand concurrency traffic. Live-read by the
+	// request limiter so admin changes apply without restart.
 	MaxInFlightRequests int `json:"maxInFlightRequests,omitempty"`
 
 	// Proxy configuration: optional outbound proxy for Kiro API requests
@@ -288,7 +289,7 @@ type AccountInfo struct {
 }
 
 // Version current version
-const Version = "1.2.0"
+const Version = "1.3.3"
 
 var (
 	cfg     *Config
@@ -750,6 +751,46 @@ func UpdateStats(totalReq, successReq, failedReq, totalTokens int, totalCredits 
 	cfg.TotalTokens = totalTokens
 	cfg.TotalCredits = totalCredits
 	return saveStatsLocked()
+}
+
+// ResetAllStats clears lifetime totals, today's counters, archived daily history,
+// and per-account runtime usage counters. Upstream quota/subscription fields are kept.
+// Uses a full save so SQLite daily_stats_history is rewritten (not merely upserted).
+func ResetAllStats() error {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	if cfg == nil {
+		return errors.New("config not initialized")
+	}
+	today := time.Now().Format("2006-01-02")
+
+	cfg.TotalRequests = 0
+	cfg.SuccessRequests = 0
+	cfg.FailedRequests = 0
+	cfg.TotalTokens = 0
+	cfg.TotalCredits = 0
+
+	cfg.DailyRequests = 0
+	cfg.DailySuccessRequests = 0
+	cfg.DailyFailedRequests = 0
+	cfg.DailyTokens = 0
+	cfg.DailyCredits = 0
+	cfg.DailyDate = today
+	cfg.DailyStatsHistory = nil
+
+	for i := range cfg.Accounts {
+		cfg.Accounts[i].RequestCount = 0
+		cfg.Accounts[i].ErrorCount = 0
+		cfg.Accounts[i].LastUsed = 0
+		cfg.Accounts[i].TotalTokens = 0
+		cfg.Accounts[i].TotalCredits = 0
+		cfg.Accounts[i].DailyRequests = 0
+		cfg.Accounts[i].DailyTokens = 0
+		cfg.Accounts[i].DailyCredits = 0
+		cfg.Accounts[i].DailyDate = today
+	}
+	logger.Infof("[Stats] Reset all lifetime/daily/history counters and per-account runtime stats")
+	return saveLocked()
 }
 
 func GetStats() (int, int, int, int, float64) {

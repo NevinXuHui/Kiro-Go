@@ -10,6 +10,7 @@ services:
     environment:
       - CONFIG_PATH=/app/data/config.json
       - DATABASE_PATH=/app/data/kiro.db
+      - REQUEST_LOGS_MAX=10000
     ulimits:
       nofile:
         soft: 65536

@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -87,6 +88,22 @@ CREATE TABLE IF NOT EXISTS schema_meta (
   key   TEXT PRIMARY KEY,
   value TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS request_logs (
+  id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  time          INTEGER NOT NULL,
+  endpoint      TEXT    NOT NULL DEFAULT '',
+  model         TEXT    NOT NULL DEFAULT '',
+  account_id    TEXT    NOT NULL DEFAULT '',
+  account_email TEXT    NOT NULL DEFAULT '',
+  status        TEXT    NOT NULL DEFAULT '',
+  error         TEXT    NOT NULL DEFAULT '',
+  error_type    TEXT    NOT NULL DEFAULT '',
+  tokens        INTEGER NOT NULL DEFAULT 0,
+  credits       REAL    NOT NULL DEFAULT 0,
+  duration      INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_request_logs_time ON request_logs(time DESC);
+CREATE INDEX IF NOT EXISTS idx_request_logs_status_id ON request_logs(status, id DESC);
 INSERT OR IGNORE INTO schema_meta(key, value) VALUES('version', '1');
 `
 	if _, err := handle.Exec(schema); err != nil {
@@ -675,6 +692,8 @@ func migrateJSONFileToDB(jsonPath string) error {
 
 // closeDB closes the database handle (tests / shutdown).
 func closeDB() {
+	requestLogMu.Lock()
+	defer requestLogMu.Unlock()
 	if db != nil {
 		// Best-effort WAL checkpoint so kiro.db is self-contained after stop.
 		_, _ = db.Exec(`PRAGMA wal_checkpoint(TRUNCATE)`)
@@ -682,6 +701,168 @@ func closeDB() {
 		db = nil
 		dbPath = ""
 	}
+}
+
+
+
+// requestLogMu serializes request-log writes without taking cfgLock on the hot path.
+var requestLogMu sync.Mutex
+
+// RequestLogEntry is a persisted admin request log row.
+type RequestLogEntry struct {
+	Time         int64   `json:"time"`
+	Endpoint     string  `json:"endpoint"`
+	Model        string  `json:"model"`
+	AccountID    string  `json:"accountId"`
+	AccountEmail string  `json:"accountEmail,omitempty"`
+	Status       string  `json:"status"`
+	Error        string  `json:"error,omitempty"`
+	ErrorType    string  `json:"errorType,omitempty"`
+	Tokens       int     `json:"tokens"`
+	Credits      float64 `json:"credits"`
+	Duration     int64   `json:"duration"`
+}
+
+// InsertRequestLogs appends one or more request logs and prunes to keepMax newest rows.
+// keepMax <= 0 skips pruning. Safe when DB is closed (no-op).
+func InsertRequestLogs(entries []RequestLogEntry, keepMax int) error {
+	if len(entries) == 0 {
+		return nil
+	}
+	requestLogMu.Lock()
+	defer requestLogMu.Unlock()
+	if db == nil {
+		return nil
+	}
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	stmt, err := tx.Prepare(`INSERT INTO request_logs(
+		time, endpoint, model, account_id, account_email, status, error, error_type, tokens, credits, duration
+	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+	if err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	for _, e := range entries {
+		if _, err := stmt.Exec(
+			e.Time, e.Endpoint, e.Model, e.AccountID, e.AccountEmail,
+			e.Status, e.Error, e.ErrorType, e.Tokens, e.Credits, e.Duration,
+		); err != nil {
+			_ = stmt.Close()
+			_ = tx.Rollback()
+			return err
+		}
+	}
+	_ = stmt.Close()
+	if keepMax > 0 {
+		// Faster than NOT IN (subquery): delete rows older than the keepMax-th newest id.
+		var cutoff sql.NullInt64
+		err := tx.QueryRow(`
+			SELECT id FROM request_logs ORDER BY id DESC LIMIT 1 OFFSET ?`, keepMax).Scan(&cutoff)
+		if err == nil && cutoff.Valid {
+			if _, err := tx.Exec(`DELETE FROM request_logs WHERE id <= ?`, cutoff.Int64); err != nil {
+				_ = tx.Rollback()
+				return err
+			}
+		} else if err != nil && err != sql.ErrNoRows {
+			_ = tx.Rollback()
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+// ListRequestLogs returns newest-first request logs, up to limit.
+func ListRequestLogs(limit int) ([]RequestLogEntry, error) {
+	return ListRequestLogsPage(limit, 0, "", 0)
+}
+
+// ListRequestLogsPage returns newest-first logs with offset/status filter.
+// errorMaxLen > 0 truncates Error for list payloads (full text remains in DB).
+func ListRequestLogsPage(limit, offset int, status string, errorMaxLen int) ([]RequestLogEntry, error) {
+	requestLogMu.Lock()
+	defer requestLogMu.Unlock()
+	if db == nil {
+		return nil, nil
+	}
+	if limit <= 0 {
+		limit = 100
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	status = strings.TrimSpace(strings.ToLower(status))
+	var (
+		rows *sql.Rows
+		err  error
+	)
+	if status == "success" || status == "error" {
+		rows, err = db.Query(`
+			SELECT time, endpoint, model, account_id, account_email, status, error, error_type, tokens, credits, duration
+			FROM request_logs
+			WHERE status = ?
+			ORDER BY id DESC
+			LIMIT ? OFFSET ?`, status, limit, offset)
+	} else {
+		rows, err = db.Query(`
+			SELECT time, endpoint, model, account_id, account_email, status, error, error_type, tokens, credits, duration
+			FROM request_logs
+			ORDER BY id DESC
+			LIMIT ? OFFSET ?`, limit, offset)
+	}
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make([]RequestLogEntry, 0, limit)
+	for rows.Next() {
+		var e RequestLogEntry
+		if err := rows.Scan(
+			&e.Time, &e.Endpoint, &e.Model, &e.AccountID, &e.AccountEmail,
+			&e.Status, &e.Error, &e.ErrorType, &e.Tokens, &e.Credits, &e.Duration,
+		); err != nil {
+			return nil, err
+		}
+		if errorMaxLen > 0 && len(e.Error) > errorMaxLen {
+			// Keep rune-safe-ish truncation for UI list; full error stays in DB.
+			e.Error = e.Error[:errorMaxLen] + "…"
+		}
+		out = append(out, e)
+	}
+	return out, rows.Err()
+}
+
+// CountRequestLogs returns total rows, optionally filtered by status (success/error).
+func CountRequestLogs(status string) (total, success, errorCount int, err error) {
+	requestLogMu.Lock()
+	defer requestLogMu.Unlock()
+	if db == nil {
+		return 0, 0, 0, nil
+	}
+	if err = db.QueryRow(`SELECT COUNT(*) FROM request_logs`).Scan(&total); err != nil {
+		return 0, 0, 0, err
+	}
+	if err = db.QueryRow(`SELECT COUNT(*) FROM request_logs WHERE status = 'success'`).Scan(&success); err != nil {
+		return 0, 0, 0, err
+	}
+	if err = db.QueryRow(`SELECT COUNT(*) FROM request_logs WHERE status = 'error'`).Scan(&errorCount); err != nil {
+		return 0, 0, 0, err
+	}
+	_ = status
+	return total, success, errorCount, nil
+}
+
+// ClearRequestLogs deletes all persisted request logs.
+func ClearRequestLogs() error {
+	requestLogMu.Lock()
+	defer requestLogMu.Unlock()
+	if db == nil {
+		return nil
+	}
+	_, err := db.Exec(`DELETE FROM request_logs`)
+	return err
 }
 
 // CloseStore flushes SQLite and closes the handle. Safe to call multiple times.

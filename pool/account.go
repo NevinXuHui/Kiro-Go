@@ -551,8 +551,30 @@ func (p *AccountPool) TakeDirtyAccountStats() []config.AccountRuntimeStats {
 	return out
 }
 
+// ResetRuntimeStats clears in-memory per-account request/token/credit counters.
+// Does not change enablement, ban, tokens, or upstream quota fields.
+func (p *AccountPool) ResetRuntimeStats() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	today := time.Now().Format("2006-01-02")
+	for i := range p.accounts {
+		p.accounts[i].RequestCount = 0
+		p.accounts[i].ErrorCount = 0
+		p.accounts[i].LastUsed = 0
+		p.accounts[i].TotalTokens = 0
+		p.accounts[i].TotalCredits = 0
+		p.accounts[i].DailyRequests = 0
+		p.accounts[i].DailyTokens = 0
+		p.accounts[i].DailyCredits = 0
+		p.accounts[i].DailyDate = today
+	}
+	// Drop dirty set so background saver does not re-apply old counters.
+	p.dirty = make(map[string]struct{})
+}
+
 // GetAllAccounts 获取所有账号副本
 func (p *AccountPool) GetAllAccounts() []config.Account {
+
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	result := make([]config.Account, len(p.accounts))

@@ -295,3 +295,63 @@ func TestArchiveDailyStatsUpsertsMax(t *testing.T) {
 		t.Fatalf("expand failed: %+v", hist[0])
 	}
 }
+
+
+func TestResetAllStatsClearsLifetimeAndHistory(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.json")
+	if err := Init(path); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	t.Cleanup(CloseStore)
+
+	if err := AddAccount(Account{
+		ID:            "acc-1",
+		Email:         "a@example.com",
+		AccessToken:   "tok",
+		Enabled:       true,
+		RequestCount:  9,
+		ErrorCount:    2,
+		TotalTokens:   100,
+		TotalCredits:  1.5,
+		DailyRequests: 3,
+		DailyTokens:   30,
+		DailyCredits:  0.3,
+		DailyDate:     "2026-07-24",
+	}); err != nil {
+		t.Fatalf("AddAccount: %v", err)
+	}
+	if err := UpdateStats(50, 40, 10, 500, 12.5); err != nil {
+		t.Fatalf("UpdateStats: %v", err)
+	}
+	if err := ArchiveDailyStats("2026-07-23", 20, 15, 5, 200, 3.0); err != nil {
+		t.Fatalf("Archive: %v", err)
+	}
+	if err := UpdateDailyStats(7, 5, 2, 70, 0.7); err != nil {
+		t.Fatalf("UpdateDailyStats: %v", err)
+	}
+
+	if err := ResetAllStats(); err != nil {
+		t.Fatalf("ResetAllStats: %v", err)
+	}
+
+	totReq, totOK, totFail, totTok, totCred := GetStats()
+	if totReq != 0 || totOK != 0 || totFail != 0 || totTok != 0 || totCred != 0 {
+		t.Fatalf("lifetime not cleared: %d %d %d %d %v", totReq, totOK, totFail, totTok, totCred)
+	}
+	dReq, dOK, dFail, dTok, dCred, _ := GetDailyStats()
+	if dReq != 0 || dOK != 0 || dFail != 0 || dTok != 0 || dCred != 0 {
+		t.Fatalf("daily not cleared: %d %d %d %d %v", dReq, dOK, dFail, dTok, dCred)
+	}
+	if hist := GetDailyStatsHistory(); len(hist) != 0 {
+		t.Fatalf("history len=%d want 0", len(hist))
+	}
+	accs := GetAccounts()
+	if len(accs) != 1 {
+		t.Fatalf("accounts=%d", len(accs))
+	}
+	a := accs[0]
+	if a.RequestCount != 0 || a.ErrorCount != 0 || a.TotalTokens != 0 || a.TotalCredits != 0 || a.DailyRequests != 0 || a.DailyTokens != 0 || a.DailyCredits != 0 {
+		t.Fatalf("account runtime stats not cleared: %+v", a)
+	}
+}

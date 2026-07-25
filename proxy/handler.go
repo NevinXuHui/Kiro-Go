@@ -9,6 +9,8 @@ import (
 	"kiro-go/logger"
 	"kiro-go/pool"
 	"net/http"
+	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -21,19 +23,25 @@ const tokenRefreshSkewSeconds int64 = 120
 
 // RequestLog stores details about a single API request (success or failure).
 type RequestLog struct {
-	Time      int64   `json:"time"`      // Unix timestamp
-	Endpoint  string  `json:"endpoint"`  // claude/openai/responses
-	Model     string  `json:"model"`     // Requested model
-	AccountID string  `json:"accountId"` // Account used
-	Status    string  `json:"status"`    // "success" or "error"
-	Error     string  `json:"error"`     // Error message (empty on success)
-	ErrorType string  `json:"errorType"` // Error category (empty on success)
-	Tokens    int     `json:"tokens"`    // Total tokens (input+output, 0 on failure)
-	Credits   float64 `json:"credits"`   // Credits consumed (0 on failure)
-	Duration  int64   `json:"duration"`  // Request duration in ms
+	Time         int64   `json:"time"`                   // Unix timestamp
+	Endpoint     string  `json:"endpoint"`               // claude/openai/responses
+	Model        string  `json:"model"`                  // Requested model
+	AccountID    string  `json:"accountId"`              // Account used
+	AccountEmail string  `json:"accountEmail,omitempty"` // Email snapshot for UI when account list is filtered/deleted
+	Status       string  `json:"status"`                 // "success" or "error"
+	Error        string  `json:"error"`                  // Error message (empty on success)
+	ErrorType    string  `json:"errorType"`              // Error category (empty on success)
+	Tokens       int     `json:"tokens"`                 // Total tokens (input+output, 0 on failure)
+	Credits      float64 `json:"credits"`                // Credits consumed (0 on failure)
+	Duration     int64   `json:"duration"`               // Request duration in ms
 }
 
-const requestLogsMaxSize = 500
+// defaultRequestLogsMaxSize is the in-memory ring capacity when REQUEST_LOGS_MAX is unset.
+// 500 is too small under multi-account concurrency and drops useful history quickly.
+const defaultRequestLogsMaxSize = 10000
+const minRequestLogsMaxSize = 100
+const maxRequestLogsMaxSize = 100000
+
 
 // Handler HTTP 处理器
 type Handler struct {
@@ -64,11 +72,17 @@ type Handler struct {
 	// per-account token refresh locks (key=accountID, value=*sync.Mutex).
 	// Avoids a single global lock serializing 4k concurrent refresh storms.
 	tokenRefreshLocks sync.Map
-	// 请求日志 (环形缓冲区，包含成功和失败)
-	requestLogs   []RequestLog
-	requestLogsMu sync.RWMutex
-	// 全局 in-flight 限流：仅保护重型生成 API；nil 表示不限流（测试零值兼容）
-	inFlight chan struct{}
+	// 请求日志 (内存环形缓冲 + SQLite 持久化)
+	requestLogs        []RequestLog
+	requestLogsMu      sync.RWMutex
+	requestLogsMaxSize int
+	requestLogPersist  chan RequestLog
+	stopRequestLogs    chan struct{}
+	// 全局 in-flight 限流：仅保护重型生成 API。
+	// inFlightLimitOn=false（零值 Handler / 测试）表示不限流。
+	// 上限实时读取 config.GetMaxInFlightRequests()，前端改设置无需重启。
+	inFlightLimitOn bool
+	inFlightCount   atomic.Int64
 	// 后台任务生命周期
 	closeOnce sync.Once
 	wg        sync.WaitGroup
@@ -266,10 +280,22 @@ func NewHandler() *Handler {
 		stopRefresh:          make(chan struct{}),
 		stopStatsSaver:       make(chan struct{}),
 		promptCache:          newPromptCacheTracker(defaultPromptCacheTTL),
-		inFlight:             make(chan struct{}, config.GetMaxInFlightRequests()),
+		inFlightLimitOn:      true,
+		requestLogsMaxSize:   resolveRequestLogsMaxSize(),
+		requestLogPersist:    make(chan RequestLog, 4096),
+		stopRequestLogs:      make(chan struct{}),
 	}
+	logger.Infof("[RequestLogs] in-memory capacity=%d (env REQUEST_LOGS_MAX), SQLite persistence enabled", h.requestLogsMaxSize)
+	logger.Infof("[InFlight] max concurrent generation requests=%d (settings maxInFlightRequests)", config.GetMaxInFlightRequests())
+	h.loadRequestLogsFromStore()
 	// 启动时对齐跨日：若磁盘日期已是今天但内存基数来自旧日，ensure 会在后续请求中滚动
 	h.ensureDailyCounters()
+	// 异步落盘请求日志，避免热路径写 SQLite
+	h.wg.Add(1)
+	go func() {
+		defer h.wg.Done()
+		h.backgroundRequestLogFlusher()
+	}()
 	// 启动后台刷新
 	h.wg.Add(1)
 	go func() {
@@ -294,27 +320,40 @@ func NewHandler() *Handler {
 }
 
 // tryAcquireInFlight tries to reserve one in-flight slot without blocking.
-// nil channel (zero-value Handler in tests) always succeeds.
+// Zero-value Handler (inFlightLimitOn=false) always succeeds for unit tests.
+// Limit is read live from config so admin settings take effect without restart.
 func (h *Handler) tryAcquireInFlight() bool {
-	if h == nil || h.inFlight == nil {
+	if h == nil || !h.inFlightLimitOn {
 		return true
 	}
-	select {
-	case h.inFlight <- struct{}{}:
-		return true
-	default:
-		return false
+	max := int64(config.GetMaxInFlightRequests())
+	if max < 1 {
+		max = 1
+	}
+	for {
+		cur := h.inFlightCount.Load()
+		if cur >= max {
+			return false
+		}
+		if h.inFlightCount.CompareAndSwap(cur, cur+1) {
+			return true
+		}
 	}
 }
 
 // releaseInFlight releases one in-flight slot.
 func (h *Handler) releaseInFlight() {
-	if h == nil || h.inFlight == nil {
+	if h == nil || !h.inFlightLimitOn {
 		return
 	}
-	select {
-	case <-h.inFlight:
-	default:
+	for {
+		cur := h.inFlightCount.Load()
+		if cur <= 0 {
+			return
+		}
+		if h.inFlightCount.CompareAndSwap(cur, cur-1) {
+			return
+		}
 	}
 }
 
@@ -330,6 +369,9 @@ func (h *Handler) Close() error {
 		}
 		if h.stopRefresh != nil {
 			close(h.stopRefresh)
+		}
+		if h.stopRequestLogs != nil {
+			close(h.stopRequestLogs)
 		}
 		h.wg.Wait()
 		// Extra safety flush in case stats saver was never started (tests).
@@ -1018,6 +1060,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 	startInputTokens := estimatedInputTokens
 	excluded := make(map[string]bool)
 	var lastErr error
+	var lastAccountID string
 	messageStarted := false
 	var messageStartUsage promptCacheUsage
 
@@ -1048,6 +1091,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 		}
 		if err := h.ensureValidToken(account); err != nil {
 			lastErr = err
+			lastAccountID = account.ID
 			excluded[account.ID] = true
 			h.handleAccountFailure(account, err)
 			continue
@@ -1373,6 +1417,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 		err := CallKiroAPI(account, payload, callback)
 		if err != nil {
 			lastErr = err
+			lastAccountID = account.ID
 			excluded[account.ID] = true
 			h.handleAccountFailure(account, err)
 			if !messageStarted {
@@ -1438,7 +1483,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 		return
 	}
 
-	h.recordFailureWithDetails("claude", model, "", lastErr)
+	h.recordFailureWithDetails("claude", model, lastAccountID, lastErr)
 	h.sendClaudeError(w, 500, "api_error", lastErr.Error())
 }
 
@@ -1625,6 +1670,67 @@ func (h *Handler) recordSuccessForApiKey(apiKeyID string, inputTokens, outputTok
 	}
 }
 
+// resolveAccountLogIdentity fills account id/email for request logs.
+// Prefers explicit id; falls back to parsing "account=... id=..." prefixes from errors.
+func (h *Handler) resolveAccountLogIdentity(accountID, errMsg string) (id, email string) {
+	id = strings.TrimSpace(accountID)
+	if id != "" && h.pool != nil {
+		if a := h.pool.GetByID(id); a != nil {
+			return a.ID, strings.TrimSpace(a.Email)
+		}
+		for _, a := range config.GetAccounts() {
+			if a.ID == id {
+				return a.ID, strings.TrimSpace(a.Email)
+			}
+		}
+	}
+	if errMsg == "" {
+		return id, email
+	}
+	// Parse prefixes produced by withAccountContext / CallKiroAPI.
+	// Examples:
+	//   account=user@x.com id=acc-1 userId=...: HTTP 403 ...
+	//   account=user@x.com: HTTP 400 ...
+	parsedID, parsedEmail := parseAccountIdentityFromError(errMsg)
+	if id == "" {
+		id = parsedID
+	}
+	email = parsedEmail
+	if email == "" && id != "" {
+		for _, a := range config.GetAccounts() {
+			if a.ID == id {
+				email = strings.TrimSpace(a.Email)
+				break
+			}
+		}
+	}
+	return id, email
+}
+
+// parseAccountIdentityFromError extracts local account labels embedded in error text.
+func parseAccountIdentityFromError(msg string) (id, email string) {
+	// Only inspect the prefix before the first ": HTTP" / ": " upstream marker.
+	head := msg
+	if i := strings.Index(msg, ": HTTP "); i >= 0 {
+		head = msg[:i]
+	} else if i := strings.Index(msg, ": "); i >= 0 && i < 200 {
+		head = msg[:i]
+	}
+	fields := strings.Fields(head)
+	for _, f := range fields {
+		switch {
+		case strings.HasPrefix(f, "account="):
+			email = strings.TrimPrefix(f, "account=")
+			if email == "<nil>" || email == "<unknown>" {
+				email = ""
+			}
+		case strings.HasPrefix(f, "id="):
+			id = strings.TrimPrefix(f, "id=")
+		}
+	}
+	return id, email
+}
+
 // recordFailureWithDetails records a failure and stores it in the request logs.
 func (h *Handler) recordFailureWithDetails(endpoint, model, accountID string, err error) {
 	atomic.AddInt64(&h.totalRequests, 1)
@@ -1638,15 +1744,17 @@ func (h *Handler) recordFailureWithDetails(endpoint, model, accountID string, er
 
 	errMsg := err.Error()
 	errType := classifyError(errMsg)
+	id, email := h.resolveAccountLogIdentity(accountID, errMsg)
 
 	entry := RequestLog{
-		Time:      time.Now().Unix(),
-		Endpoint:  endpoint,
-		Model:     model,
-		AccountID: accountID,
-		Status:    "error",
-		Error:     errMsg,
-		ErrorType: errType,
+		Time:         time.Now().Unix(),
+		Endpoint:     endpoint,
+		Model:        model,
+		AccountID:    id,
+		AccountEmail: email,
+		Status:       "error",
+		Error:        errMsg,
+		ErrorType:    errType,
 	}
 
 	h.appendRequestLog(entry)
@@ -1654,41 +1762,189 @@ func (h *Handler) recordFailureWithDetails(endpoint, model, accountID string, er
 
 // recordSuccessLog records a successful request in the request logs.
 func (h *Handler) recordSuccessLog(endpoint, model, accountID string, tokens int, credits float64, durationMs int64) {
+	id, email := h.resolveAccountLogIdentity(accountID, "")
 	entry := RequestLog{
-		Time:      time.Now().Unix(),
-		Endpoint:  endpoint,
-		Model:     model,
-		AccountID: accountID,
-		Status:    "success",
-		Tokens:    tokens,
-		Credits:   credits,
-		Duration:  durationMs,
+		Time:         time.Now().Unix(),
+		Endpoint:     endpoint,
+		Model:        model,
+		AccountID:    id,
+		AccountEmail: email,
+		Status:       "success",
+		Tokens:       tokens,
+		Credits:      credits,
+		Duration:     durationMs,
 	}
 
 	h.appendRequestLog(entry)
 }
 
 func (h *Handler) appendRequestLog(entry RequestLog) {
+	maxSize := h.requestLogsMaxSize
+	if maxSize <= 0 {
+		maxSize = defaultRequestLogsMaxSize
+	}
 	h.requestLogsMu.Lock()
 	if h.requestLogs == nil {
-		h.requestLogs = make([]RequestLog, 0, requestLogsMaxSize)
+		h.requestLogs = make([]RequestLog, 0, maxSize)
 	}
-	if len(h.requestLogs) >= requestLogsMaxSize {
-		h.requestLogs = h.requestLogs[1:]
+	if len(h.requestLogs) >= maxSize {
+		// Drop oldest in bulk when far over capacity to avoid O(n) shift storms.
+		over := len(h.requestLogs) - maxSize + 1
+		h.requestLogs = h.requestLogs[over:]
 	}
 	h.requestLogs = append(h.requestLogs, entry)
 	h.requestLogsMu.Unlock()
+	h.enqueueRequestLogPersist(entry)
+}
+
+func (h *Handler) enqueueRequestLogPersist(entry RequestLog) {
+	if h == nil || h.requestLogPersist == nil {
+		return
+	}
+	select {
+	case h.requestLogPersist <- entry:
+	default:
+		// Queue full under extreme load: drop this persist attempt rather than block request path.
+		logger.Warnf("[RequestLogs] persist queue full, dropping one entry")
+	}
+}
+
+func (h *Handler) loadRequestLogsFromStore() {
+	if h == nil {
+		return
+	}
+	// Warm only a small recent window for crash-recovery continuity.
+	// Admin UI reads from SQLite with pagination; avoid loading 10k rows at boot.
+	const warmLimit = 500
+	maxSize := warmLimit
+	if h.requestLogsMaxSize > 0 && h.requestLogsMaxSize < warmLimit {
+		maxSize = h.requestLogsMaxSize
+	}
+	rows, err := config.ListRequestLogs(maxSize)
+	if err != nil {
+		logger.Warnf("[RequestLogs] load from SQLite failed: %v", err)
+		return
+	}
+	if len(rows) == 0 {
+		return
+	}
+	// ListRequestLogs is newest-first; memory ring stores oldest→newest.
+	loaded := make([]RequestLog, 0, len(rows))
+	for i := len(rows) - 1; i >= 0; i-- {
+		r := rows[i]
+		loaded = append(loaded, RequestLog{
+			Time:         r.Time,
+			Endpoint:     r.Endpoint,
+			Model:        r.Model,
+			AccountID:    r.AccountID,
+			AccountEmail: r.AccountEmail,
+			Status:       r.Status,
+			Error:        r.Error,
+			ErrorType:    r.ErrorType,
+			Tokens:       r.Tokens,
+			Credits:      r.Credits,
+			Duration:     r.Duration,
+		})
+	}
+	h.requestLogsMu.Lock()
+	h.requestLogs = loaded
+	h.requestLogsMu.Unlock()
+	logger.Infof("[RequestLogs] loaded %d entries from SQLite", len(loaded))
+}
+
+func (h *Handler) backgroundRequestLogFlusher() {
+	const flushEvery = 2 * time.Second
+	const batchMax = 200
+	ticker := time.NewTicker(flushEvery)
+	defer ticker.Stop()
+
+	buf := make([]config.RequestLogEntry, 0, batchMax)
+	flush := func() {
+		if len(buf) == 0 {
+			return
+		}
+		keep := h.requestLogsMaxSize
+		if keep <= 0 {
+			keep = defaultRequestLogsMaxSize
+		}
+		if err := config.InsertRequestLogs(buf, keep); err != nil {
+			logger.Warnf("[RequestLogs] SQLite insert failed: %v", err)
+		}
+		buf = buf[:0]
+	}
+
+	for {
+		select {
+		case <-h.stopRequestLogs:
+			for {
+				select {
+				case e := <-h.requestLogPersist:
+					buf = append(buf, toConfigRequestLog(e))
+					if len(buf) >= batchMax {
+						flush()
+					}
+				default:
+					flush()
+					return
+				}
+			}
+		case e := <-h.requestLogPersist:
+			buf = append(buf, toConfigRequestLog(e))
+			if len(buf) >= batchMax {
+				flush()
+			}
+		case <-ticker.C:
+			flush()
+		}
+	}
+}
+
+func toConfigRequestLog(e RequestLog) config.RequestLogEntry {
+	return config.RequestLogEntry{
+		Time:         e.Time,
+		Endpoint:     e.Endpoint,
+		Model:        e.Model,
+		AccountID:    e.AccountID,
+		AccountEmail: e.AccountEmail,
+		Status:       e.Status,
+		Error:        e.Error,
+		ErrorType:    e.ErrorType,
+		Tokens:       e.Tokens,
+		Credits:      e.Credits,
+		Duration:     e.Duration,
+	}
+}
+
+// resolveRequestLogsMaxSize reads REQUEST_LOGS_MAX (default 10000, clamp 100..100000).
+func resolveRequestLogsMaxSize() int {
+	raw := strings.TrimSpace(os.Getenv("REQUEST_LOGS_MAX"))
+	if raw == "" {
+		return defaultRequestLogsMaxSize
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil {
+		logger.Warnf("[RequestLogs] invalid REQUEST_LOGS_MAX=%q, using default %d", raw, defaultRequestLogsMaxSize)
+		return defaultRequestLogsMaxSize
+	}
+	if n < minRequestLogsMaxSize {
+		return minRequestLogsMaxSize
+	}
+	if n > maxRequestLogsMaxSize {
+		return maxRequestLogsMaxSize
+	}
+	return n
 }
 
 // classifyError categorizes an error message into a type for display.
 func classifyError(msg string) string {
 	switch {
-	case isQuotaErrorMessage(msg):
-		return "quota"
-	case isOverageErrorMessage(msg):
-		return "overage"
+	// Suspension before quota: User IDs may contain digit sequences like 4429.
 	case isSuspensionErrorMessage(msg):
 		return "suspended"
+	case isOverageErrorMessage(msg):
+		return "overage"
+	case isQuotaErrorMessage(msg):
+		return "quota"
 	case isAuthErrorMessage(msg):
 		return "auth"
 	case isProfileUnavailableErrorMessage(msg):
@@ -1716,6 +1972,7 @@ func (h *Handler) getRequestLogs() []RequestLog {
 func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, thinkingOpts claudeThinkingResponseOptions, estimatedInputTokens int, cacheProfile *promptCacheProfile, apiKeyID string) {
 	excluded := make(map[string]bool)
 	var lastErr error
+	var lastAccountID string
 	reqStart := time.Now()
 
 	for attempt := 0; attempt < maxAccountRetryAttempts; attempt++ {
@@ -1725,6 +1982,7 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 		}
 		if err := h.ensureValidToken(account); err != nil {
 			lastErr = err
+			lastAccountID = account.ID
 			excluded[account.ID] = true
 			h.handleAccountFailure(account, err)
 			continue
@@ -1764,6 +2022,7 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 		err := CallKiroAPI(account, payload, callback)
 		if err != nil {
 			lastErr = err
+			lastAccountID = account.ID
 			excluded[account.ID] = true
 			h.handleAccountFailure(account, err)
 			continue
@@ -1830,7 +2089,7 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 		return
 	}
 
-	h.recordFailureWithDetails("claude", model, "", lastErr)
+	h.recordFailureWithDetails("claude", model, lastAccountID, lastErr)
 	h.sendClaudeError(w, 500, "api_error", lastErr.Error())
 }
 
@@ -1903,6 +2162,7 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 	chatID := "chatcmpl-" + uuid.New().String()
 	excluded := make(map[string]bool)
 	var lastErr error
+	var lastAccountID string
 	reqStart := time.Now()
 
 	for attempt := 0; attempt < maxAccountRetryAttempts; attempt++ {
@@ -1912,6 +2172,7 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 		}
 		if err := h.ensureValidToken(account); err != nil {
 			lastErr = err
+			lastAccountID = account.ID
 			excluded[account.ID] = true
 			h.handleAccountFailure(account, err)
 			continue
@@ -2201,6 +2462,7 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 		err := CallKiroAPI(account, payload, callback)
 		if err != nil {
 			lastErr = err
+			lastAccountID = account.ID
 			excluded[account.ID] = true
 			h.handleAccountFailure(account, err)
 			if !responseStarted {
@@ -2272,7 +2534,7 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 		return
 	}
 
-	h.recordFailureWithDetails("openai", model, "", lastErr)
+	h.recordFailureWithDetails("openai", model, lastAccountID, lastErr)
 	h.sendOpenAIError(w, 500, "server_error", lastErr.Error())
 }
 
@@ -2280,6 +2542,7 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, estimatedInputTokens int, apiKeyID string) {
 	excluded := make(map[string]bool)
 	var lastErr error
+	var lastAccountID string
 	reqStart := time.Now()
 
 	for attempt := 0; attempt < maxAccountRetryAttempts; attempt++ {
@@ -2289,6 +2552,7 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayl
 		}
 		if err := h.ensureValidToken(account); err != nil {
 			lastErr = err
+			lastAccountID = account.ID
 			excluded[account.ID] = true
 			h.handleAccountFailure(account, err)
 			continue
@@ -2320,6 +2584,7 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayl
 		err := CallKiroAPI(account, payload, callback)
 		if err != nil {
 			lastErr = err
+			lastAccountID = account.ID
 			excluded[account.ID] = true
 			h.handleAccountFailure(account, err)
 			continue
@@ -2356,7 +2621,7 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayl
 		return
 	}
 
-	h.recordFailureWithDetails("openai", model, "", lastErr)
+	h.recordFailureWithDetails("openai", model, lastAccountID, lastErr)
 	h.sendOpenAIError(w, 500, "server_error", lastErr.Error())
 }
 
@@ -2511,6 +2776,8 @@ func (h *Handler) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 		h.apiGetStats(w, r)
 	case path == "/stats/reset" && r.Method == "POST":
 		h.apiResetStats(w, r)
+	case path == "/stats/reset-all" && r.Method == "POST":
+		h.apiResetAllStats(w, r)
 	case path == "/logs" && r.Method == "GET":
 		h.apiGetLogs(w, r)
 	case path == "/logs" && r.Method == "DELETE":
@@ -3536,9 +3803,148 @@ func (h *Handler) apiResetStats(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func (h *Handler) apiGetLogs(w http.ResponseWriter, r *http.Request) {
+
+func (h *Handler) apiResetAllStats(w http.ResponseWriter, r *http.Request) {
+	// Dangerous: clears lifetime totals, daily counters, daily history, and
+	// per-account runtime usage counters. Does not delete accounts or request logs.
+	h.dailyMu.Lock()
+	atomic.StoreInt64(&h.totalRequests, 0)
+	atomic.StoreInt64(&h.successRequests, 0)
+	atomic.StoreInt64(&h.failedRequests, 0)
+	atomic.StoreInt64(&h.totalTokens, 0)
+	h.creditsMu.Lock()
+	h.totalCredits = 0
+	h.creditsMu.Unlock()
+	atomic.StoreInt64(&h.dailyRequests, 0)
+	atomic.StoreInt64(&h.dailySuccessRequests, 0)
+	atomic.StoreInt64(&h.dailyFailedRequests, 0)
+	atomic.StoreInt64(&h.dailyTokens, 0)
+	h.dailyCredits = 0
+	h.dailyDate = time.Now().Format("2006-01-02")
+	h.dailyMu.Unlock()
+
+	if h.pool != nil {
+		h.pool.ResetRuntimeStats()
+	}
+	if err := config.ResetAllStats(); err != nil {
+		w.WriteHeader(500)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"logs": h.getRequestLogs(),
+		"success": true,
+		"message": "all lifetime totals, daily counters, history, and account runtime stats reset",
+	})
+}
+
+func (h *Handler) apiGetLogs(w http.ResponseWriter, r *http.Request) {
+	// Paginated read from SQLite (fast path). Falls back to in-memory ring if DB empty/unavailable.
+	q := r.URL.Query()
+	limit := 100
+	if v := strings.TrimSpace(q.Get("limit")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			limit = n
+		}
+	}
+	if limit <= 0 {
+		limit = 100
+	}
+	if limit > 500 {
+		limit = 500
+	}
+	offset := 0
+	if v := strings.TrimSpace(q.Get("offset")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			offset = n
+		}
+	}
+	status := strings.ToLower(strings.TrimSpace(q.Get("status")))
+	if status != "success" && status != "error" {
+		status = ""
+	}
+
+	const errorPreviewLen = 300
+	rows, err := config.ListRequestLogsPage(limit, offset, status, errorPreviewLen)
+	if err != nil {
+		logger.Warnf("[RequestLogs] list page failed: %v", err)
+		w.WriteHeader(500)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+	total, successN, errorN, cerr := config.CountRequestLogs(status)
+	if cerr != nil {
+		logger.Warnf("[RequestLogs] count failed: %v", cerr)
+	}
+
+	// Fallback: if DB has no rows yet, serve memory ring (tests / pre-flush).
+	if len(rows) == 0 && offset == 0 {
+		mem := h.getRequestLogs()
+		if status == "success" || status == "error" {
+			filtered := make([]RequestLog, 0, len(mem))
+			for _, e := range mem {
+				if e.Status == status {
+					filtered = append(filtered, e)
+				}
+			}
+			mem = filtered
+		}
+		total = len(mem)
+		successN, errorN = 0, 0
+		for _, e := range mem {
+			if e.Status == "success" {
+				successN++
+			} else if e.Status == "error" {
+				errorN++
+			}
+		}
+		if offset > len(mem) {
+			mem = nil
+		} else {
+			end := offset + limit
+			if end > len(mem) {
+				end = len(mem)
+			}
+			mem = mem[offset:end]
+		}
+		out := make([]map[string]interface{}, 0, len(mem))
+		for _, e := range mem {
+			errMsg := e.Error
+			if len(errMsg) > errorPreviewLen {
+				errMsg = errMsg[:errorPreviewLen] + "…"
+			}
+			out = append(out, map[string]interface{}{
+				"time": e.Time, "endpoint": e.Endpoint, "model": e.Model,
+				"accountId": e.AccountID, "accountEmail": e.AccountEmail,
+				"status": e.Status, "error": errMsg, "errorType": e.ErrorType,
+				"tokens": e.Tokens, "credits": e.Credits, "duration": e.Duration,
+			})
+		}
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"logs": out, "total": total, "success": successN, "error": errorN,
+			"limit": limit, "offset": offset, "status": status,
+		})
+		return
+	}
+
+	out := make([]map[string]interface{}, 0, len(rows))
+	for _, e := range rows {
+		out = append(out, map[string]interface{}{
+			"time": e.Time, "endpoint": e.Endpoint, "model": e.Model,
+			"accountId": e.AccountID, "accountEmail": e.AccountEmail,
+			"status": e.Status, "error": e.Error, "errorType": e.ErrorType,
+			"tokens": e.Tokens, "credits": e.Credits, "duration": e.Duration,
+		})
+	}
+	// When filtering, total should reflect filtered count for pagination.
+	filteredTotal := total
+	if status == "success" {
+		filteredTotal = successN
+	} else if status == "error" {
+		filteredTotal = errorN
+	}
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"logs": out, "total": filteredTotal, "success": successN, "error": errorN,
+		"limit": limit, "offset": offset, "status": status,
 	})
 }
 
@@ -3546,6 +3952,12 @@ func (h *Handler) apiClearLogs(w http.ResponseWriter, r *http.Request) {
 	h.requestLogsMu.Lock()
 	h.requestLogs = h.requestLogs[:0]
 	h.requestLogsMu.Unlock()
+	if err := config.ClearRequestLogs(); err != nil {
+		logger.Warnf("[RequestLogs] clear SQLite failed: %v", err)
+		w.WriteHeader(500)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
 	json.NewEncoder(w).Encode(map[string]bool{"success": true})
 }
 

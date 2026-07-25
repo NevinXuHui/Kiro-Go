@@ -699,10 +699,16 @@
     if (dailyFailedEl) dailyFailedEl.textContent = d.dailyFailedRequests || 0;
   }
 
-  // ===== Logs =====
+  // ===== Logs (server-side pagination) =====
   let logsFilter = 'all';
   let logsAutoTimer = null;
   let logsCache = [];
+  let logsPage = 1;
+  let logsPageSize = 100;
+  let logsTotal = 0;
+  let logsSuccessTotal = 0;
+  let logsErrorTotal = 0;
+  let logsLoading = false;
 
   function errorTypeLabel(type) {
     if (!type) return '';
@@ -717,7 +723,11 @@
       pad(d.getHours()) + ':' + pad(d.getMinutes()) + ':' + pad(d.getSeconds());
   }
 
-  function accountLabel(id) {
+  function accountLabel(id, email) {
+    const snapEmail = (email || '').trim();
+    if (snapEmail) {
+      return privacyModeEnabled ? maskEmail(snapEmail) : snapEmail;
+    }
     if (!id) return '-';
     const acc = accountsData.find(a => a.id === id);
     if (acc && acc.email) {
@@ -726,15 +736,86 @@
     return id.slice(0, 8);
   }
 
-  async function loadLogs() {
+  function logsTotalPages() {
+    return Math.max(1, Math.ceil((logsTotal || 0) / logsPageSize));
+  }
+
+  async function loadLogs(opts = {}) {
+    if (logsLoading) return;
+    const resetPage = !!opts.resetPage;
+    if (resetPage) logsPage = 1;
+    const list = $('logsList');
+    if (list && !opts.silent) {
+      list.innerHTML = '<p class="text-muted">' + escapeHtml(t('logs.loading')) + '</p>';
+    }
+    logsLoading = true;
     try {
-      const res = await api('/logs');
+      const offset = (logsPage - 1) * logsPageSize;
+      const params = new URLSearchParams({
+        limit: String(logsPageSize),
+        offset: String(offset)
+      });
+      if (logsFilter === 'success' || logsFilter === 'error') {
+        params.set('status', logsFilter);
+      }
+      const res = await api('/logs?' + params.toString());
+      if (!res.ok) throw new Error('http ' + res.status);
       const d = await res.json();
       const logs = d.logs || [];
+      logsTotal = Number(d.total) || logs.length;
+      logsSuccessTotal = Number(d.success) || 0;
+      logsErrorTotal = Number(d.error) || 0;
+      // Clamp page if filter shrunk results
+      const pages = logsTotalPages();
+      if (logsPage > pages) {
+        logsPage = pages;
+        logsLoading = false;
+        return loadLogs({ silent: true });
+      }
       renderLogs(logs);
     } catch (e) {
-      // silent
+      if (list) {
+        list.innerHTML = '<p class="text-muted">' + escapeHtml(t('logs.loadFailed')) + '</p>';
+      }
+    } finally {
+      logsLoading = false;
     }
+  }
+
+  function renderLogsPager() {
+    const pager = $('logsPager');
+    if (!pager) return;
+    const pages = logsTotalPages();
+    if (logsTotal <= 0) {
+      pager.innerHTML = '';
+      return;
+    }
+    pager.innerHTML =
+      '<button class="btn btn-outline btn-sm" id="logsPrevBtn"' + (logsPage <= 1 ? ' disabled' : '') + '>' +
+        escapeHtml(t('logs.prev')) + '</button>' +
+      '<span class="text-muted">' + escapeHtml(t('logs.page', logsPage, pages)) +
+        ' · ' + escapeHtml(t('logs.total')) + ' ' + logsTotal + '</span>' +
+      '<button class="btn btn-outline btn-sm" id="logsNextBtn"' + (logsPage >= pages ? ' disabled' : '') + '>' +
+        escapeHtml(t('logs.next')) + '</button>' +
+      '<label class="text-muted" style="margin-left:8px;">' + escapeHtml(t('logs.pageSize')) +
+        ' <select id="logsPageSizeSelect">' +
+        [50, 100, 200, 500].map(n =>
+          '<option value="' + n + '"' + (n === logsPageSize ? ' selected' : '') + '>' + n + '</option>'
+        ).join('') +
+        '</select></label>';
+    const prev = $('logsPrevBtn');
+    const next = $('logsNextBtn');
+    const sizeSel = $('logsPageSizeSelect');
+    if (prev) prev.onclick = () => { if (logsPage > 1) { logsPage--; loadLogs(); } };
+    if (next) next.onclick = () => { if (logsPage < pages) { logsPage++; loadLogs(); } };
+    if (sizeSel) sizeSel.onchange = () => {
+      const n = parseInt(sizeSel.value, 10);
+      if (Number.isFinite(n) && n > 0) {
+        logsPageSize = n;
+        logsPage = 1;
+        loadLogs();
+      }
+    };
   }
 
   function renderLogs(logs) {
@@ -743,18 +824,20 @@
     const summary = $('logsSummary');
     if (!list) return;
 
-    const total = logs.length;
-    const okCount = logs.filter(l => l.status === 'success').length;
-    const errCount = total - okCount;
-    summary.innerHTML =
-      '<span>' + escapeHtml(t('logs.total')) + ': <strong>' + total + '</strong></span>' +
-      '<span>' + escapeHtml(t('logs.success')) + ': <strong>' + okCount + '</strong></span>' +
-      '<span>' + escapeHtml(t('logs.errors')) + ': <strong>' + errCount + '</strong></span>';
+    // totals from server (full DB), not just current page
+    const totalShown = logsFilter === 'all' ? logsTotal : logsTotal;
+    const okCount = logsSuccessTotal;
+    const errCount = logsErrorTotal;
+    if (summary) {
+      summary.innerHTML =
+        '<span>' + escapeHtml(t('logs.total')) + ': <strong>' + totalShown + '</strong></span>' +
+        '<span>' + escapeHtml(t('logs.success')) + ': <strong>' + okCount + '</strong></span>' +
+        '<span>' + escapeHtml(t('logs.errors')) + ': <strong>' + errCount + '</strong></span>';
+    }
 
-    const filtered = logs.filter(l => logsFilter === 'all' || l.status === logsFilter);
-
-    if (!filtered.length) {
+    if (!logs.length) {
       list.innerHTML = '<p class="text-muted">' + escapeHtml(t('logs.empty')) + '</p>';
+      renderLogsPager();
       return;
     }
 
@@ -768,7 +851,7 @@
       '<th>' + escapeHtml(t('logs.duration')) + '</th>' +
       '<th>' + escapeHtml(t('logs.detail')) + '</th>' +
       '</tr></thead><tbody>';
-    for (const l of filtered) {
+    for (const l of logs) {
       const isErr = l.status === 'error';
       const statusCell = '<span class="log-status log-status--' + escapeAttr(l.status) + '">' +
         escapeHtml(isErr ? t('logs.statusError') : t('logs.statusSuccess')) + '</span>';
@@ -776,16 +859,16 @@
       if (isErr) {
         detailCell = '<span class="err-badge err-badge--' + escapeAttr(l.errorType || 'unknown') + '">' +
           escapeHtml(errorTypeLabel(l.errorType || 'unknown')) + '</span> ' +
-          '<span class="log-msg" title="' + escapeAttr(l.error) + '">' + escapeHtml(l.error) + '</span>';
+          '<span class="log-msg" title="' + escapeAttr(l.error || '') + '">' + escapeHtml(l.error || '') + '</span>';
       } else {
-        detailCell = '<span class="text-muted">' + (l.credits ? (l.credits.toFixed(3) + ' cr') : '-') + '</span>';
+        detailCell = '<span class="text-muted">' + (l.credits ? (Number(l.credits).toFixed(3) + ' cr') : '-') + '</span>';
       }
       html += '<tr>' +
         '<td>' + escapeHtml(formatLogTime(l.time)) + '</td>' +
         '<td>' + statusCell + '</td>' +
-        '<td>' + escapeHtml(l.endpoint) + '</td>' +
+        '<td>' + escapeHtml(l.endpoint || '') + '</td>' +
         '<td>' + escapeHtml(l.model || '-') + '</td>' +
-        '<td>' + escapeHtml(accountLabel(l.accountId)) + '</td>' +
+        '<td>' + escapeHtml(accountLabel(l.accountId, l.accountEmail)) + '</td>' +
         '<td>' + (l.tokens ? formatNum(l.tokens) : '-') + '</td>' +
         '<td>' + (l.duration ? (l.duration + 'ms') : '-') + '</td>' +
         '<td>' + detailCell + '</td>' +
@@ -793,11 +876,16 @@
     }
     html += '</tbody></table>';
     list.innerHTML = html;
+    renderLogsPager();
   }
 
   async function clearLogs() {
     if (!confirm(t('logs.clearConfirm'))) return;
     await api('/logs', { method: 'DELETE' });
+    logsPage = 1;
+    logsTotal = 0;
+    logsSuccessTotal = 0;
+    logsErrorTotal = 0;
     renderLogs([]);
     toast(t('logs.cleared'), 'success');
   }
@@ -807,7 +895,7 @@
     if (logsAutoTimer) { clearInterval(logsAutoTimer); logsAutoTimer = null; }
     if (on) {
       logsAutoTimer = setInterval(() => {
-        if (!$('tabLogs').classList.contains('hidden')) loadLogs();
+        if (!$('tabLogs').classList.contains('hidden')) loadLogs({ silent: true });
       }, 5000);
     }
   }
@@ -2197,6 +2285,13 @@
     importConcurrency = Number.isFinite(impConc) && impConc > 0 ? Math.min(200, Math.max(1, impConc)) : 100;
     const impInput = $('importConcurrency');
     if (impInput) impInput.value = String(importConcurrency);
+    const maxInFlight = parseInt(d.maxInFlightRequests, 10);
+    const maxInFlightInput = $('maxInFlightRequests');
+    if (maxInFlightInput) {
+      maxInFlightInput.value = String(
+        Number.isFinite(maxInFlight) && maxInFlight > 0 ? Math.min(20000, Math.max(1, maxInFlight)) : 4500
+      );
+    }
     await Promise.all([loadThinkingConfig(), loadEndpointConfig(), loadProxyConfig(), loadPromptFilter(), loadApiKeys()]);
     refreshCustomSelects();
   }
@@ -2313,13 +2408,19 @@
       toast(t('settings.importConcurrencyInvalid'), 'warning');
       return;
     }
+    const rawMaxInFlight = parseInt(($('maxInFlightRequests') && $('maxInFlightRequests').value) || '4500', 10);
+    if (!Number.isFinite(rawMaxInFlight) || rawMaxInFlight < 1 || rawMaxInFlight > 20000) {
+      toast(t('settings.maxInFlightRequestsInvalid'), 'warning');
+      return;
+    }
     await api('/settings', {
       method: 'POST',
       body: JSON.stringify({
         allowOverUsage,
         showExhaustedAccounts: showExhaustedAccountsValue,
         batchTestConcurrency: rawConc,
-        importConcurrency: rawImportConc
+        importConcurrency: rawImportConc,
+        maxInFlightRequests: rawMaxInFlight
       })
     });
     showExhaustedAccounts = showExhaustedAccountsValue;
@@ -2354,6 +2455,22 @@
       if (!res.ok) throw new Error(t('common.failed'));
       loadStats();
       toastPrimary(t('settings.statsReset'));
+    } catch (e) {
+      toastError((e && e.message) || t('common.failed'));
+    }
+  }
+  async function resetAllStats() {
+    const ok = await confirmAction(t('settings.confirmResetAll'), {
+      title: t('settings.resetAllStats'),
+      confirmText: t('settings.resetAllStats'),
+      variant: 'danger'
+    });
+    if (!ok) return;
+    try {
+      const res = await api('/stats/reset-all', { method: 'POST' });
+      if (!res.ok) throw new Error(t('common.failed'));
+      await Promise.all([loadStats(), loadAccounts()]);
+      toastPrimary(t('settings.statsResetAll'));
     } catch (e) {
       toastError((e && e.message) || t('common.failed'));
     }
@@ -3526,7 +3643,7 @@
     const logsFilterSel = $('logsFilterSelect');
     if (logsFilterSel) logsFilterSel.addEventListener('change', e => {
       logsFilter = e.target.value;
-      loadLogs();
+      loadLogs({ resetPage: true });
     });
   }
 
@@ -3585,6 +3702,8 @@
     $('proxyType').addEventListener('change', onProxyTypeChange);
     $('saveProxyBtn').addEventListener('click', saveProxyConfig);
     $('resetStatsBtn').addEventListener('click', resetStats);
+    const resetAllBtn = $('resetAllStatsBtn');
+    if (resetAllBtn) resetAllBtn.addEventListener('click', resetAllStats);
     bindApiKeyEvents();
   }
 
