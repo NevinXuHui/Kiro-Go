@@ -143,6 +143,7 @@ curl http://localhost:8080/v1/chat/completions \
 |-----|------|-------|
 | `CONFIG_PATH` | 遗留配置路径（首次启动若存在则自动迁移到 SQLite） | `data/config.json` |
 | `DATABASE_PATH` | SQLite 数据库路径（主存储） | `data/kiro.db` |
+| `REQUEST_LOGS_MAX` | 管理面板请求日志条数上限（内存+SQLite 持久化，重启可恢复） | `10000` |
 | `ADMIN_PASSWORD` | 管理面板密码（覆盖配置文件） | - |
 
 ## 参与贡献

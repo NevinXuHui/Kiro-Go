@@ -143,6 +143,7 @@ The setting takes effect immediately without restarting.
 |----------|-------------|---------|
 | `CONFIG_PATH` | Legacy config path (auto-migrated to SQLite on first boot) | `data/config.json` |
 | `DATABASE_PATH` | SQLite database path (primary store) | `data/kiro.db` |
+| `REQUEST_LOGS_MAX` | Request log capacity (memory + SQLite persistence across restarts) | `10000` |
 | `ADMIN_PASSWORD` | Admin panel password (overrides config) | - |
 
 ## Contributing
