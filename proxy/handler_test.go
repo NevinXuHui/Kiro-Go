@@ -33,18 +33,22 @@ func TestClaudeNonStreamRetriesNextAccountAfterPreResponseFailure(t *testing.T) 
 	}
 
 	if err := config.AddAccount(config.Account{
-		ID:          "first",
-		Enabled:     true,
-		AccessToken: "token-first",
-		ProfileArn:  "arn:aws:codewhisperer:profile/first",
+		ID:           "first",
+		Enabled:      true,
+		AccessToken:  "token-first",
+		ProfileArn:   "arn:aws:codewhisperer:profile/first",
+		RequestCount: 1,
+		LastUsed:     1,
 	}); err != nil {
 		t.Fatalf("add first account: %v", err)
 	}
 	if err := config.AddAccount(config.Account{
-		ID:          "second",
-		Enabled:     true,
-		AccessToken: "token-second",
-		ProfileArn:  "arn:aws:codewhisperer:profile/second",
+		ID:           "second",
+		Enabled:      true,
+		AccessToken:  "token-second",
+		ProfileArn:   "arn:aws:codewhisperer:profile/second",
+		RequestCount: 1,
+		LastUsed:     1,
 	}); err != nil {
 		t.Fatalf("add second account: %v", err)
 	}
@@ -85,6 +89,7 @@ func TestClaudeNonStreamRetriesNextAccountAfterPreResponseFailure(t *testing.T) 
 	defer kiroHttpStore.Store(oldClient)
 
 	p := accountpool.GetPool()
+	p.ResetSchedulingState()
 	p.Reload()
 	h := &Handler{
 		pool:        p,

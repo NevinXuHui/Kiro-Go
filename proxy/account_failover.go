@@ -128,6 +128,8 @@ func (h *Handler) disableAccount(account *config.Account, banStatus, banReason s
 	if account == nil {
 		return
 	}
+	// Always drop the select() in-flight claim — this path does not go through RecordError.
+	defer h.pool.ReleaseInFlight(account.ID)
 
 	updatedAccount := *account
 	if !updatedAccount.Enabled && updatedAccount.BanStatus == banStatus && updatedAccount.BanReason == banReason {

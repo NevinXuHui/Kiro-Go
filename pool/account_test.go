@@ -410,48 +410,39 @@ func TestTakeDirtyAccountStatsOnlyReturnsChanged(t *testing.T) {
 func TestNewAccountFirstUseIntervalSerializesVirgins(t *testing.T) {
 	p := &AccountPool{
 		firstUseStarted: make(map[string]struct{}),
+		inFlight:        make(map[string]int),
 	}
-	// Two never-used imported accounts.
 	p.accounts = []config.Account{
-		{ID: "new-a", AccessToken: "t", Enabled: true},
-		{ID: "new-b", AccessToken: "t", Enabled: true},
+		{ID: "new-a", AccessToken: "t", Enabled: true, UsageCurrent: 0, UsageLimit: 50},
+		{ID: "new-b", AccessToken: "t", Enabled: true, UsageCurrent: 0, UsageLimit: 50},
 	}
 
 	first := p.GetNext()
 	if first == nil {
 		t.Fatal("expected first virgin account")
 	}
-	// Immediately after, only the already-claimed virgin may be selected again;
-	// the other virgin must wait for the global first-use interval.
+	p.ReleaseInFlight(first.ID)
+
+	// Within interval: claimed virgin is no longer "virgin", so it is selected as experienced.
+	// The other virgin must wait.
 	ids := map[string]int{}
 	for i := 0; i < 20; i++ {
 		acc := p.GetNext()
 		if acc == nil {
-			t.Fatalf("iteration %d: expected claimed virgin still selectable", i)
+			t.Fatalf("iteration %d: expected claimed account still selectable", i)
 		}
 		if acc.ID != first.ID {
 			t.Fatalf("iteration %d: got second virgin %q too early; want only %q", i, acc.ID, first.ID)
 		}
 		ids[acc.ID]++
+		p.ReleaseInFlight(acc.ID)
 	}
 	if len(ids) != 1 {
 		t.Fatalf("expected single active first-use account, got %v", ids)
 	}
 
-	// After the interval, the other virgin may be claimed.
 	p.mu.Lock()
 	p.nextNewFirstUseAt = time.Now().Add(-time.Second)
-	p.mu.Unlock()
-
-	// Mark first as used so pass-1 still has a non-virgin, then force only virgins
-	// by excluding the used one — second virgin should now be claimable.
-	p.mu.Lock()
-	for i := range p.accounts {
-		if p.accounts[i].ID == first.ID {
-			p.accounts[i].RequestCount = 1
-			p.accounts[i].LastUsed = time.Now().Unix()
-		}
-	}
 	p.mu.Unlock()
 
 	second := p.GetNextExcluding(map[string]bool{first.ID: true})
@@ -463,43 +454,52 @@ func TestNewAccountFirstUseIntervalSerializesVirgins(t *testing.T) {
 	}
 }
 
-func TestNewAccountFirstUsePrefersExperiencedAccounts(t *testing.T) {
-	p := &AccountPool{firstUseStarted: make(map[string]struct{})}
+func TestNewAccountFirstUseIntroducesVirginOnIntervalEvenIfExperiencedExists(t *testing.T) {
+	p := &AccountPool{firstUseStarted: make(map[string]struct{}), inFlight: make(map[string]int)}
+	// Interval open + equal remaining: must still introduce the virgin (spaced first-use),
+	// not sticky-pick experienced forever.
 	p.accounts = []config.Account{
-		{ID: "used", AccessToken: "t", RequestCount: 5, LastUsed: time.Now().Unix()},
-		{ID: "new", AccessToken: "t"},
+		{ID: "used", AccessToken: "t", RequestCount: 5, LastUsed: time.Now().Unix(), UsageCurrent: 0, UsageLimit: 50},
+		{ID: "new", AccessToken: "t", UsageCurrent: 0, UsageLimit: 50},
 	}
-	for i := 0; i < 10; i++ {
-		acc := p.GetNext()
-		if acc == nil {
-			t.Fatal("expected account")
+	acc := p.GetNext()
+	if acc == nil || acc.ID != "new" {
+		t.Fatalf("expected virgin introduced when interval open, got %+v", acc)
+	}
+	p.ReleaseInFlight(acc.ID)
+
+	// Within interval, only experienced (including just-claimed) may be used.
+	for i := 0; i < 5; i++ {
+		again := p.GetNext()
+		if again == nil {
+			t.Fatal("expected experienced account within interval")
 		}
-		if acc.ID != "used" {
-			t.Fatalf("expected experienced account preferred over virgin, got %q", acc.ID)
+		// "new" is now claimed so it is eligible as experienced; "used" also eligible.
+		if again.ID != "new" && again.ID != "used" {
+			t.Fatalf("unexpected account %q", again.ID)
 		}
+		p.ReleaseInFlight(again.ID)
 	}
 }
 
 func TestNewAccountFirstUseAllowsOnlyVirginWhenNoExperienced(t *testing.T) {
-	p := &AccountPool{firstUseStarted: make(map[string]struct{})}
+	p := &AccountPool{firstUseStarted: make(map[string]struct{}), inFlight: make(map[string]int)}
 	p.accounts = []config.Account{
-		{ID: "only-new", AccessToken: "t"},
+		{ID: "only-new", AccessToken: "t", UsageCurrent: 0, UsageLimit: 50},
 	}
 	acc := p.GetNext()
 	if acc == nil || acc.ID != "only-new" {
 		t.Fatalf("expected only virgin to be claimable, got %+v", acc)
 	}
-	// Within interval, same claimed virgin remains available.
+	p.ReleaseInFlight(acc.ID)
 	again := p.GetNext()
 	if again == nil || again.ID != "only-new" {
 		t.Fatalf("expected claimed virgin reusable, got %+v", again)
 	}
 }
 
-
 func TestSelectPrefersHigherRemainingQuota(t *testing.T) {
-	p := &AccountPool{firstUseStarted: make(map[string]struct{})}
-	// Both already used so virgin gate does not apply.
+	p := &AccountPool{firstUseStarted: make(map[string]struct{}), inFlight: make(map[string]int)}
 	p.accounts = []config.Account{
 		{ID: "low", AccessToken: "t", RequestCount: 3, LastUsed: 1, UsageCurrent: 90, UsageLimit: 100},
 		{ID: "high", AccessToken: "t", RequestCount: 3, LastUsed: 1, UsageCurrent: 10, UsageLimit: 100},
@@ -512,18 +512,66 @@ func TestSelectPrefersHigherRemainingQuota(t *testing.T) {
 		if acc.ID != "high" {
 			t.Fatalf("iter %d: expected higher remaining quota account, got %q", i, acc.ID)
 		}
+		p.ReleaseInFlight(acc.ID)
 	}
 }
 
-func TestSelectPrefersRemainingAmongExperiencedBeforeVirgin(t *testing.T) {
-	p := &AccountPool{firstUseStarted: make(map[string]struct{})}
+func TestSelectHoldsVirginWhileFirstUseIntervalBlocks(t *testing.T) {
+	p := &AccountPool{
+		firstUseStarted:   make(map[string]struct{}),
+		inFlight:          make(map[string]int),
+		nextNewFirstUseAt: time.Now().Add(time.Hour),
+	}
 	p.accounts = []config.Account{
-		{ID: "used-low", AccessToken: "t", RequestCount: 2, LastUsed: 1, UsageCurrent: 80, UsageLimit: 100},
-		{ID: "virgin-full", AccessToken: "t", UsageCurrent: 0, UsageLimit: 100},
+		{ID: "used-low", AccessToken: "t", RequestCount: 2, LastUsed: 1, UsageCurrent: 40, UsageLimit: 50},
+		{ID: "new-full", AccessToken: "t", UsageCurrent: 0, UsageLimit: 50},
+	}
+	for i := 0; i < 5; i++ {
+		acc := p.GetNext()
+		if acc == nil || acc.ID != "used-low" {
+			t.Fatalf("iter %d: expected used account while virgin first-use gated, got %+v", i, acc)
+		}
+		p.ReleaseInFlight(acc.ID)
+	}
+}
+
+func TestSelectNeverForceVirginPastInterval(t *testing.T) {
+	p := &AccountPool{
+		firstUseStarted:   make(map[string]struct{}),
+		inFlight:          make(map[string]int),
+		nextNewFirstUseAt: time.Now().Add(time.Hour),
+	}
+	p.accounts = []config.Account{
+		{ID: "new-a", AccessToken: "t", UsageCurrent: 0, UsageLimit: 50},
+		{ID: "new-b", AccessToken: "t", UsageCurrent: 0, UsageLimit: 50},
+	}
+	if acc := p.GetNext(); acc != nil {
+		t.Fatalf("expected nil while first-use interval blocks all virgins, got %+v", acc)
+	}
+}
+
+func TestSelectSkipsExhaustedFiftyFiftyEvenIfNeverRequested(t *testing.T) {
+	p := &AccountPool{firstUseStarted: make(map[string]struct{}), inFlight: make(map[string]int)}
+	p.accounts = []config.Account{
+		{ID: "exhausted", AccessToken: "t", UsageCurrent: 50, UsageLimit: 50},
+		{ID: "used-ok", AccessToken: "t", RequestCount: 1, LastUsed: 1, UsageCurrent: 10, UsageLimit: 50},
 	}
 	acc := p.GetNext()
-	if acc == nil || acc.ID != "used-low" {
-		t.Fatalf("expected experienced account before virgin, got %+v", acc)
+	if acc == nil || acc.ID != "used-ok" {
+		t.Fatalf("expected usable used account, got %+v", acc)
+	}
+}
+
+func TestSelectIntroducesBestVirginByRemainingOnInterval(t *testing.T) {
+	p := &AccountPool{firstUseStarted: make(map[string]struct{}), inFlight: make(map[string]int)}
+	p.accounts = []config.Account{
+		{ID: "used", AccessToken: "t", RequestCount: 2, LastUsed: 1, UsageCurrent: 5, UsageLimit: 50},
+		{ID: "new-low", AccessToken: "t", UsageCurrent: 20, UsageLimit: 50},
+		{ID: "new-high", AccessToken: "t", UsageCurrent: 0, UsageLimit: 50},
+	}
+	acc := p.GetNext()
+	if acc == nil || acc.ID != "new-high" {
+		t.Fatalf("expected highest-remaining virgin on interval open, got %+v", acc)
 	}
 }
 
@@ -536,5 +584,58 @@ func TestRemainingQuotaHelper(t *testing.T) {
 	}
 	if remainingQuota(config.Account{UsageLimit: 10, UsageCurrent: 15}) != 0 {
 		t.Fatalf("over-limit remaining should be 0")
+	}
+	if remainingQuota(config.Account{UsageLimit: 50, UsageCurrent: 50}) != 0 {
+		t.Fatalf("50/50 exhausted remaining should be 0")
+	}
+	if remainingQuota(config.Account{UsageLimit: 50, UsageCurrent: 0}) != 50 {
+		t.Fatalf("full new-account remaining should be 50")
+	}
+}
+
+func TestSelectSpreadsEqualRemainingAcrossInFlight(t *testing.T) {
+	p := &AccountPool{firstUseStarted: make(map[string]struct{}), inFlight: make(map[string]int)}
+	// Same remaining quota: concurrent picks must not all sticky-bind one ID.
+	p.accounts = []config.Account{
+		{ID: "a", AccessToken: "t", RequestCount: 5, LastUsed: 1, UsageCurrent: 4, UsageLimit: 50},
+		{ID: "b", AccessToken: "t", RequestCount: 5, LastUsed: 1, UsageCurrent: 4, UsageLimit: 50},
+		{ID: "c", AccessToken: "t", RequestCount: 5, LastUsed: 1, UsageCurrent: 4, UsageLimit: 50},
+	}
+	seen := map[string]int{}
+	held := make([]*config.Account, 0, 6)
+	for i := 0; i < 6; i++ {
+		acc := p.GetNext()
+		if acc == nil {
+			t.Fatal("expected account")
+		}
+		seen[acc.ID]++
+		held = append(held, acc)
+	}
+	if len(seen) < 3 {
+		t.Fatalf("expected concurrent equal-remaining picks to spread across accounts, got %v", seen)
+	}
+	for _, acc := range held {
+		p.ReleaseInFlight(acc.ID)
+	}
+}
+
+func TestSelectRotatesEqualRemainingSerially(t *testing.T) {
+	p := &AccountPool{firstUseStarted: make(map[string]struct{}), inFlight: make(map[string]int)}
+	p.accounts = []config.Account{
+		{ID: "a", AccessToken: "t", RequestCount: 1, LastUsed: 1, UsageCurrent: 4, UsageLimit: 50},
+		{ID: "b", AccessToken: "t", RequestCount: 1, LastUsed: 1, UsageCurrent: 4, UsageLimit: 50},
+		{ID: "c", AccessToken: "t", RequestCount: 1, LastUsed: 1, UsageCurrent: 4, UsageLimit: 50},
+	}
+	seen := map[string]int{}
+	for i := 0; i < 9; i++ {
+		acc := p.GetNext()
+		if acc == nil {
+			t.Fatal("expected account")
+		}
+		seen[acc.ID]++
+		p.RecordSuccess(acc.ID)
+	}
+	if len(seen) < 3 {
+		t.Fatalf("expected serial equal-remaining picks to rotate, got %v", seen)
 	}
 }

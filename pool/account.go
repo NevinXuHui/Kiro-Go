@@ -26,6 +26,10 @@ type AccountPool struct {
 	errorCounts   map[string]int             // 连续错误计数
 	modelLists    map[string]map[string]bool // accountID → set of modelIDs (from ListAvailableModels)
 	dirty         map[string]struct{}        // accountIDs with stats/token dirty for deferred persist
+	// inFlight tracks accounts currently serving a generation request.
+	// Used so equal-remaining peers spread across concurrent traffic instead of
+	// sticky-picking one account until background quota refresh moves.
+	inFlight map[string]int
 
 	// firstUseStarted marks accounts that already claimed their "first use" slot
 	// this process lifetime (survives Reload until stats show real usage).
@@ -46,6 +50,7 @@ func GetPool() *AccountPool {
 			cooldowns:       make(map[string]time.Time),
 			errorCounts:     make(map[string]int),
 			modelLists:      make(map[string]map[string]bool),
+			inFlight:        make(map[string]int),
 			firstUseStarted: make(map[string]struct{}),
 		}
 		pool.Reload()
@@ -143,9 +148,18 @@ func remainingQuota(acc config.Account) float64 {
 	return left
 }
 
-// betterAccount reports whether candidate is preferable to current best under
-// "prefer more remaining quota, then higher weight" within the same pass.
-func betterAccount(candidate, best *config.Account) bool {
+func (p *AccountPool) inFlightCount(id string) int {
+	if p.inFlight == nil {
+		return 0
+	}
+	return p.inFlight[id]
+}
+
+// betterAccount reports whether candidate is preferable to current best under:
+// higher remaining quota → lower in-flight → higher weight → experienced over virgin.
+// Full ties keep the first candidate in RR walk order (return false) so concurrent
+// picks with different start cursors naturally spread instead of sticky-IDing.
+func betterAccount(p *AccountPool, candidate, best *config.Account) bool {
 	if best == nil {
 		return true
 	}
@@ -153,23 +167,70 @@ func betterAccount(candidate, best *config.Account) bool {
 	if cr != br {
 		return cr > br
 	}
-	// Tie-break: higher operator weight, then lower lifetime request count
-	// (spread load), then stable ID order.
+	if p != nil {
+		ci, bi := p.inFlightCount(candidate.ID), p.inFlightCount(best.ID)
+		if ci != bi {
+			return ci < bi
+		}
+	}
 	cw, bw := effectiveWeight(candidate.Weight), effectiveWeight(best.Weight)
 	if cw != bw {
 		return cw > bw
 	}
-	if candidate.RequestCount != best.RequestCount {
-		return candidate.RequestCount < best.RequestCount
+	// Prefer already-used accounts over never-used when everything else ties,
+	// so equal-quota traffic does not burn first-use slots unnecessarily.
+	if p != nil {
+		cv, bv := p.isVirginAccount(candidate), p.isVirginAccount(best)
+		if cv != bv {
+			return !cv && bv
+		}
 	}
-	return candidate.ID < best.ID
+	// Equal remaining/in-flight/weight/experience: keep current best (RR order).
+	return false
+}
+
+func (p *AccountPool) claimInFlightLocked(id string) {
+	if id == "" {
+		return
+	}
+	if p.inFlight == nil {
+		p.inFlight = make(map[string]int)
+	}
+	p.inFlight[id]++
+}
+
+// ReleaseInFlight decrements the concurrent-use counter after a generation
+// attempt finishes (success or failure). Safe to call with unknown IDs.
+func (p *AccountPool) ReleaseInFlight(id string) {
+	if id == "" {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.inFlight == nil {
+		return
+	}
+	if n := p.inFlight[id]; n <= 1 {
+		delete(p.inFlight, id)
+	} else {
+		p.inFlight[id] = n - 1
+	}
 }
 
 // selectAccountLocked picks the next account. model=="" disables model filter.
 // Rules (in order):
-//  1. Prefer already-used accounts over never-used (virgin) imports
-//  2. Among eligible peers, prefer higher remaining quota
-//  3. Virgin first-use is globally rate-limited (one new account per interval)
+//  1. When the global first-use interval is open, introduce ONE never-used
+//     (virgin) account — best by remaining quota / in-flight / weight.
+//     This is "新号间隔使用": spaced first-uses, not "only if no old accounts".
+//  2. Otherwise (interval closed, or no eligible virgin): pick among already
+//     used/claimed accounts only — higher remaining, then lower in-flight.
+//  3. Never force a virgin past the first-use interval.
+//
+// Exhausted accounts (e.g. FREE 50/50) stay out via isQuotaBlocked regardless
+// of requestCount.
+//
+// A successful pick claims one in-flight slot; callers must ReleaseInFlight when
+// the attempt ends (UpdateStats / RecordError / disable paths do this).
 //
 // Caller must hold p.mu for writing (needed to claim virgin first-use).
 func (p *AccountPool) selectAccountLocked(excluded map[string]bool, model string) *config.Account {
@@ -185,7 +246,9 @@ func (p *AccountPool) selectAccountLocked(excluded map[string]bool, model string
 	// the same remaining quota (avoids sticky ID-order under ties).
 	start := int(atomic.AddUint64(&p.currentIndex, 1) % uint64(n))
 
-	pickBest := func(allowVirgin bool) *config.Account {
+	// allowVirgin: include never-used accounts.
+	// virginsOnly: only never-used (used to introduce one new account on interval).
+	pickBest := func(allowVirgin, virginsOnly bool) *config.Account {
 		var best *config.Account
 		seen := make(map[string]struct{}, 8)
 		for i := 0; i < n; i++ {
@@ -213,18 +276,19 @@ func (p *AccountPool) selectAccountLocked(excluded map[string]bool, model string
 			}
 
 			virgin := p.isVirginAccount(acc)
-			if virgin && !allowVirgin {
-				continue
-			}
-			// Do not claim yet — only claim the eventual winner to avoid
-			// burning the global first-use slot on a non-selected virgin.
 			if virgin {
+				if !allowVirgin {
+					continue
+				}
+				// Virgin first-use is always interval-gated — never force past it.
 				if !p.nextNewFirstUseAt.IsZero() && now.Before(p.nextNewFirstUseAt) {
 					continue
 				}
+			} else if virginsOnly {
+				continue
 			}
 
-			if betterAccount(acc, best) {
+			if betterAccount(p, acc, best) {
 				best = acc
 			}
 		}
@@ -232,24 +296,31 @@ func (p *AccountPool) selectAccountLocked(excluded map[string]bool, model string
 			return nil
 		}
 		if p.isVirginAccount(best) && !p.claimVirginFirstUseLocked(best, now) {
-			// Race with interval edge: treat as unavailable this pass.
+			// Interval edge race: do not select this virgin this pass.
 			return nil
 		}
+		p.claimInFlightLocked(best.ID)
 		return accountCopy(best)
 	}
 
-	// Pass 1: already-used / previously claimed accounts only.
-	if acc := pickBest(false); acc != nil {
-		return acc
+	intervalOpen := p.nextNewFirstUseAt.IsZero() || !now.Before(p.nextNewFirstUseAt)
+
+	// Pass 1: interval open → introduce exactly one new account (best virgin).
+	// Must not compete with equal-remaining experienced accounts or new accounts
+	// would never claim their first-use slot.
+	if intervalOpen {
+		if acc := pickBest(true, true); acc != nil {
+			return acc
+		}
 	}
-	// Pass 2: allow one virgin first-use if the global interval permits.
-	if acc := pickBest(true); acc != nil {
+	// Pass 2: already-used / previously claimed only.
+	if acc := pickBest(false, false); acc != nil {
 		return acc
 	}
 
 	// Fallback: earliest-cooldown non-virgin (never force a gated virgin here).
 	// Prefer the account whose cooldown ends soonest; among equal cooldowns,
-	// still prefer higher remaining quota.
+	// still prefer higher remaining quota / lower in-flight.
 	var best *config.Account
 	var earliest time.Time
 	seen := make(map[string]struct{}, 8)
@@ -274,15 +345,32 @@ func (p *AccountPool) selectAccountLocked(excluded map[string]bool, model string
 		cooldown, ok := p.cooldowns[acc.ID]
 		if !ok {
 			// Should have been picked above; return immediately as available.
+			p.claimInFlightLocked(acc.ID)
 			return accountCopy(acc)
 		}
 		if best == nil || cooldown.Before(earliest) ||
-			(cooldown.Equal(earliest) && betterAccount(acc, best)) {
+			(cooldown.Equal(earliest) && betterAccount(p, acc, best)) {
 			best = acc
 			earliest = cooldown
 		}
 	}
+	if best != nil {
+		p.claimInFlightLocked(best.ID)
+	}
 	return accountCopy(best)
+}
+
+// ResetSchedulingState clears first-use gates, cooldowns, in-flight and RR cursor.
+// Intended for tests that share the process-wide GetPool singleton.
+func (p *AccountPool) ResetSchedulingState() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.firstUseStarted = make(map[string]struct{})
+	p.nextNewFirstUseAt = time.Time{}
+	p.cooldowns = make(map[string]time.Time)
+	p.errorCounts = make(map[string]int)
+	p.inFlight = make(map[string]int)
+	p.currentIndex = 0
 }
 
 // GetNext 获取下一个可用账号（加权轮询）
@@ -368,8 +456,21 @@ func (p *AccountPool) GetByID(id string) *config.Account {
 func (p *AccountPool) RecordSuccess(id string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	delete(p.cooldowns, id)
+	if p.cooldowns != nil {
+		delete(p.cooldowns, id)
+	}
+	if p.errorCounts == nil {
+		p.errorCounts = make(map[string]int)
+	}
 	p.errorCounts[id] = 0
+	// Generation finished successfully — drop one in-flight reservation.
+	if p.inFlight != nil {
+		if n := p.inFlight[id]; n <= 1 {
+			delete(p.inFlight, id)
+		} else {
+			p.inFlight[id] = n - 1
+		}
+	}
 }
 
 // RecordError 记录请求错误，设置冷却
@@ -377,6 +478,12 @@ func (p *AccountPool) RecordError(id string, isQuotaError bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
+	if p.errorCounts == nil {
+		p.errorCounts = make(map[string]int)
+	}
+	if p.cooldowns == nil {
+		p.cooldowns = make(map[string]time.Time)
+	}
 	p.errorCounts[id]++
 
 	if isQuotaError {
@@ -385,6 +492,14 @@ func (p *AccountPool) RecordError(id string, isQuotaError bool) {
 	} else if p.errorCounts[id] >= 3 {
 		// 连续 3 次错误，冷却 1 分钟
 		p.cooldowns[id] = time.Now().Add(time.Minute)
+	}
+	// Failed attempt also ends the in-flight reservation from select.
+	if p.inFlight != nil {
+		if n := p.inFlight[id]; n <= 1 {
+			delete(p.inFlight, id)
+		} else {
+			p.inFlight[id] = n - 1
+		}
 	}
 }
 
@@ -463,6 +578,9 @@ func (p *AccountPool) DisableAccount(id, reason string) {
 	p.mu.Lock()
 	// Long cooldown as a safety net in case Reload races
 	p.cooldowns[id] = time.Now().Add(24 * time.Hour)
+	if p.inFlight != nil {
+		delete(p.inFlight, id)
+	}
 	p.mu.Unlock()
 	p.Reload()
 }
@@ -474,6 +592,9 @@ func (p *AccountPool) DisableAccount(id, reason string) {
 func (p *AccountPool) MarkOverLimit(id string) {
 	p.mu.Lock()
 	p.cooldowns[id] = time.Now().Add(time.Hour)
+	if p.inFlight != nil {
+		delete(p.inFlight, id)
+	}
 	p.mu.Unlock()
 	p.Reload()
 }

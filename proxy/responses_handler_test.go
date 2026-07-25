@@ -264,10 +264,12 @@ func setupResponsesTestHandler(t *testing.T) (*Handler, func()) {
 		t.Fatalf("config.Init: %v", err)
 	}
 	if err := config.AddAccount(config.Account{
-		ID:          "test-account",
-		Enabled:     true,
-		AccessToken: "token-test",
-		ProfileArn:  "arn:aws:codewhisperer:profile/test",
+		ID:           "test-account",
+		Enabled:      true,
+		AccessToken:  "token-test",
+		ProfileArn:   "arn:aws:codewhisperer:profile/test",
+		RequestCount: 1,
+		LastUsed:     1,
 	}); err != nil {
 		t.Fatalf("add account: %v", err)
 	}
@@ -278,6 +280,7 @@ func setupResponsesTestHandler(t *testing.T) (*Handler, func()) {
 		t.Fatalf("disable fallback: %v", err)
 	}
 	p := accountpool.GetPool()
+	p.ResetSchedulingState()
 	p.Reload()
 	h := &Handler{
 		pool:        p,
