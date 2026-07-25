@@ -107,9 +107,11 @@ func ResolveAccountProxyURL(account *config.Account) string {
 // buildKiroTransport constructs an HTTP Transport with optional outbound proxy support.
 func buildKiroTransport(proxyURL string) *http.Transport {
 	t := &http.Transport{
-		MaxIdleConns:        1024,
-		MaxIdleConnsPerHost: 512,
-		IdleConnTimeout:     90 * time.Second,
+		// Sized for >=4000 concurrent streams against shared upstream hosts.
+		MaxIdleConns:        8192,
+		MaxIdleConnsPerHost: 4096,
+		MaxConnsPerHost:     0,
+		IdleConnTimeout:     120 * time.Second,
 		DisableCompression:  false,
 		ForceAttemptHTTP2:   true,
 	}

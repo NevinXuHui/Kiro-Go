@@ -60,6 +60,13 @@ func AddApiKey(entry ApiKeyEntry) (ApiKeyEntry, error) {
 		entry.CreatedAt = time.Now().Unix()
 	}
 	cfg.ApiKeys = append(cfg.ApiKeys, entry)
+	if useDB() {
+		if err := dbUpsertApiKey(entry); err != nil {
+			cfg.ApiKeys = cfg.ApiKeys[:len(cfg.ApiKeys)-1]
+			return ApiKeyEntry{}, err
+		}
+		return entry, nil
+	}
 	if err := saveLocked(); err != nil {
 		// Roll back the in-memory append so we don't leave inconsistent state.
 		cfg.ApiKeys = cfg.ApiKeys[:len(cfg.ApiKeys)-1]
@@ -108,6 +115,9 @@ func UpdateApiKey(id string, patch ApiKeyEntry) error {
 	cfg.ApiKeys[idx].CreditLimit = patch.CreditLimit
 	if patch.Migrated {
 		cfg.ApiKeys[idx].Migrated = true
+	}
+	if useDB() {
+		return dbUpsertApiKey(cfg.ApiKeys[idx])
 	}
 	return saveLocked()
 }
@@ -184,6 +194,13 @@ func RecordApiKeyUsage(id string, tokens int64, credits float64) error {
 	defer cfgLock.Unlock()
 	if err := recordApiKeyUsageLocked(id, tokens, credits); err != nil {
 		return err
+	}
+	if useDB() {
+		for i := range cfg.ApiKeys {
+			if cfg.ApiKeys[i].ID == id {
+				return dbUpsertApiKey(cfg.ApiKeys[i])
+			}
+		}
 	}
 	return saveLocked()
 }

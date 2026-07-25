@@ -305,7 +305,11 @@ func TestRecordApiKeyUsageDeferredDoesNotPersistImmediately(t *testing.T) {
 		t.Fatalf("add: %v", err)
 	}
 
-	before, err := os.Stat(cfgFile)
+	dbFile := GetDatabasePath()
+	if dbFile == "" {
+		t.Fatal("expected sqlite database path")
+	}
+	before, err := os.Stat(dbFile)
 	if err != nil {
 		t.Fatalf("stat before: %v", err)
 	}
@@ -323,7 +327,7 @@ func TestRecordApiKeyUsageDeferredDoesNotPersistImmediately(t *testing.T) {
 		t.Fatalf("memory counters mismatch: %+v", got)
 	}
 
-	after, err := os.Stat(cfgFile)
+	after, err := os.Stat(dbFile)
 	if err != nil {
 		t.Fatalf("stat after: %v", err)
 	}

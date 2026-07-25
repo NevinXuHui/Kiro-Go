@@ -9,6 +9,7 @@ services:
       - ./data:/app/data
     environment:
       - CONFIG_PATH=/app/data/config.json
+      - DATABASE_PATH=/app/data/kiro.db
     ulimits:
       nofile:
         soft: 65536

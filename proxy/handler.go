@@ -61,7 +61,9 @@ type Handler struct {
 	modelsCacheMu   sync.RWMutex
 	modelsCacheTime int64
 	promptCache     *promptCacheTracker
-	tokenRefreshMu  sync.Mutex
+	// per-account token refresh locks (key=accountID, value=*sync.Mutex).
+	// Avoids a single global lock serializing 4k concurrent refresh storms.
+	tokenRefreshLocks sync.Map
 	// 请求日志 (环形缓冲区，包含成功和失败)
 	requestLogs   []RequestLog
 	requestLogsMu sync.RWMutex
@@ -361,46 +363,90 @@ func (h *Handler) backgroundRefresh() {
 	}
 }
 
-// refreshAllAccounts 刷新所有账户信息
+// backgroundRefreshWorkers caps concurrent account refreshes so 4k+ accounts
+// do not stampede upstream or the SQLite writer.
+const backgroundRefreshWorkers = 32
+
+// refreshAllAccounts 并发刷新账户信息（worker pool）。
 func (h *Handler) refreshAllAccounts() {
 	accounts := config.GetAccounts()
-	for i := range accounts {
-		account := &accounts[i]
-		if !account.Enabled || account.AccessToken == "" {
-			continue
-		}
+	jobs := make(chan int, len(accounts))
+	var wg sync.WaitGroup
 
-		// 检查 token 是否需要刷新
-		if account.ExpiresAt > 0 && time.Now().Unix() > account.ExpiresAt-tokenRefreshSkewSeconds {
-			newAccessToken, newRefreshToken, newExpiresAt, profileArn, err := auth.RefreshToken(account)
-			if err != nil {
-				logger.Warnf("[BackgroundRefresh] Token refresh failed for %s: %v", account.Email, err)
-				h.handleAccountFailure(account, err)
+	worker := func() {
+		defer wg.Done()
+		for i := range jobs {
+			account := &accounts[i]
+			if !account.Enabled || account.AccessToken == "" {
 				continue
 			}
-			account.AccessToken = newAccessToken
-			if newRefreshToken != "" {
-				account.RefreshToken = newRefreshToken
+			// Skip banned accounts — they cannot serve traffic until re-auth.
+			if account.BanStatus == "BANNED" || account.BanStatus == "DISABLED" {
+				continue
 			}
-			account.ExpiresAt = newExpiresAt
-			config.UpdateAccountToken(account.ID, newAccessToken, newRefreshToken, newExpiresAt)
-			h.pool.UpdateToken(account.ID, newAccessToken, newRefreshToken, newExpiresAt)
-			if profileArn != "" {
-				account.ProfileArn = profileArn
-				config.UpdateAccountProfileArn(account.ID, profileArn)
+
+			// 检查 token 是否需要刷新
+			if account.ExpiresAt > 0 && time.Now().Unix() > account.ExpiresAt-tokenRefreshSkewSeconds {
+				mu := h.accountTokenLock(account.ID)
+				mu.Lock()
+				// re-check under lock via pool
+				if latest := h.pool.GetByID(account.ID); latest != nil {
+					account.AccessToken = latest.AccessToken
+					account.RefreshToken = latest.RefreshToken
+					account.ExpiresAt = latest.ExpiresAt
+				}
+				need := account.ExpiresAt > 0 && time.Now().Unix() > account.ExpiresAt-tokenRefreshSkewSeconds
+				if need {
+					newAccessToken, newRefreshToken, newExpiresAt, profileArn, err := auth.RefreshToken(account)
+					if err != nil {
+						mu.Unlock()
+						logger.Warnf("[BackgroundRefresh] Token refresh failed for %s: %v", account.Email, err)
+						h.handleAccountFailure(account, err)
+						continue
+					}
+					account.AccessToken = newAccessToken
+					if newRefreshToken != "" {
+						account.RefreshToken = newRefreshToken
+					}
+					account.ExpiresAt = newExpiresAt
+					config.UpdateAccountToken(account.ID, newAccessToken, newRefreshToken, newExpiresAt)
+					h.pool.UpdateToken(account.ID, newAccessToken, newRefreshToken, newExpiresAt)
+					if profileArn != "" {
+						account.ProfileArn = profileArn
+						config.UpdateAccountProfileArn(account.ID, profileArn)
+					}
+				}
+				mu.Unlock()
 			}
-		}
 
-		// 刷新账户信息
-		info, err := RefreshAccountInfo(account)
-		if err != nil {
-			logger.Warnf("[BackgroundRefresh] Failed to refresh %s: %v", account.Email, err)
-			continue
-		}
+			// 刷新账户信息
+			info, err := RefreshAccountInfo(account)
+			if err != nil {
+				logger.Warnf("[BackgroundRefresh] Failed to refresh %s: %v", account.Email, err)
+				continue
+			}
 
-		config.UpdateAccountInfo(account.ID, *info)
-		logger.Infof("[BackgroundRefresh] Refreshed %s: %s %.1f/%.1f", account.Email, info.SubscriptionType, info.UsageCurrent, info.UsageLimit)
+			config.UpdateAccountInfo(account.ID, *info)
+			logger.Infof("[BackgroundRefresh] Refreshed %s: %s %.1f/%.1f", account.Email, info.SubscriptionType, info.UsageCurrent, info.UsageLimit)
+		}
 	}
+
+	workers := backgroundRefreshWorkers
+	if workers > len(accounts) && len(accounts) > 0 {
+		workers = len(accounts)
+	}
+	if workers < 1 {
+		workers = 1
+	}
+	wg.Add(workers)
+	for w := 0; w < workers; w++ {
+		go worker()
+	}
+	for i := range accounts {
+		jobs <- i
+	}
+	close(jobs)
+	wg.Wait()
 	h.pool.Reload()
 }
 
@@ -563,6 +609,7 @@ func (h *Handler) handleStats(w http.ResponseWriter, r *http.Request) {
 		"dailyTokens":          atomic.LoadInt64(&h.dailyTokens),
 		"dailyCredits":         h.getDailyCredits(),
 		"dailyDate":            time.Now().Format("2006-01-02"),
+		"dailyStatsHistory":    config.GetDailyStatsHistory(),
 		"uptime":               time.Now().Unix() - h.startTime,
 	})
 }
@@ -1426,6 +1473,7 @@ func (h *Handler) ensureDailyCounters() {
 }
 
 // rollDailyCountersLocked 必须在持有 dailyMu 时调用。
+// 跨日时先把内存中的「昨日」计数归档落盘，再清零；绝不丢弃请求统计。
 func (h *Handler) rollDailyCountersLocked(today string) {
 	if h.dailyDate == today {
 		return
@@ -1436,16 +1484,28 @@ func (h *Handler) rollDailyCountersLocked(today string) {
 	prevFailed := atomic.LoadInt64(&h.dailyFailedRequests)
 	prevTok := atomic.LoadInt64(&h.dailyTokens)
 	prevCredits := h.dailyCredits
+	if prevDate != "" {
+		// Archive before zeroing so late in-memory counters are never discarded.
+		if err := config.ArchiveDailyStats(
+			prevDate,
+			int(prevReq),
+			int(prevSuccess),
+			int(prevFailed),
+			int(prevTok),
+			prevCredits,
+		); err != nil {
+			logger.Warnf("[DailyStats] failed to archive %s before rollover: %v", prevDate, err)
+		} else {
+			logger.Infof("[DailyStats] memory day rolled from %s to %s, archived: requests=%d success=%d failed=%d tokens=%d credits=%.4f",
+				prevDate, today, prevReq, prevSuccess, prevFailed, prevTok, prevCredits)
+		}
+	}
 	atomic.StoreInt64(&h.dailyRequests, 0)
 	atomic.StoreInt64(&h.dailySuccessRequests, 0)
 	atomic.StoreInt64(&h.dailyFailedRequests, 0)
 	atomic.StoreInt64(&h.dailyTokens, 0)
 	h.dailyCredits = 0
 	h.dailyDate = today
-	if prevDate != "" {
-		logger.Infof("[DailyStats] memory day rolled from %s to %s, discarded in-memory totals: requests=%d success=%d failed=%d tokens=%d credits=%.4f",
-			prevDate, today, prevReq, prevSuccess, prevFailed, prevTok, prevCredits)
-	}
 }
 
 // bumpDailyStats 按自然日滚动后累加今日请求/成功/失败/Token/Credits。
@@ -1482,33 +1542,10 @@ func (h *Handler) saveStats() {
 	h.ensureDailyCounters()
 	dailyCredits := h.getDailyCredits()
 
+	// 仅刷 dirty 账号：4k 并发下每 30s 全量写 3k+ 行会打满 SQLite 单写者。
 	var accountStats []config.AccountRuntimeStats
 	if h.pool != nil {
-		accounts := h.pool.GetAllAccounts()
-		// 加权列表可能含重复 ID，按 ID 去重保留最新内存快照
-		seen := make(map[string]struct{}, len(accounts))
-		accountStats = make([]config.AccountRuntimeStats, 0, len(accounts))
-		for _, a := range accounts {
-			if a.ID == "" {
-				continue
-			}
-			if _, ok := seen[a.ID]; ok {
-				continue
-			}
-			seen[a.ID] = struct{}{}
-			accountStats = append(accountStats, config.AccountRuntimeStats{
-				ID:            a.ID,
-				RequestCount:  a.RequestCount,
-				ErrorCount:    a.ErrorCount,
-				LastUsed:      a.LastUsed,
-				TotalTokens:   a.TotalTokens,
-				TotalCredits:  a.TotalCredits,
-				DailyRequests: a.DailyRequests,
-				DailyTokens:   a.DailyTokens,
-				DailyCredits:  a.DailyCredits,
-				DailyDate:     a.DailyDate,
-			})
-		}
+		accountStats = h.pool.TakeDirtyAccountStats()
 	}
 
 	h.dailyMu.Lock()
@@ -2334,14 +2371,28 @@ func (h *Handler) sendOpenAIError(w http.ResponseWriter, status int, errType, me
 	})
 }
 
-// ensureValidToken 确保 token 有效
+// accountTokenLock returns the mutex used to serialize refresh for one account.
+func (h *Handler) accountTokenLock(accountID string) *sync.Mutex {
+	if accountID == "" {
+		accountID = "_"
+	}
+	if v, ok := h.tokenRefreshLocks.Load(accountID); ok {
+		return v.(*sync.Mutex)
+	}
+	mu := &sync.Mutex{}
+	actual, _ := h.tokenRefreshLocks.LoadOrStore(accountID, mu)
+	return actual.(*sync.Mutex)
+}
+
+// ensureValidToken 确保 token 有效（按账号加锁，多账号可并行刷新）。
 func (h *Handler) ensureValidToken(account *config.Account) error {
 	if account.ExpiresAt == 0 || time.Now().Unix() < account.ExpiresAt-tokenRefreshSkewSeconds {
 		return nil
 	}
 
-	h.tokenRefreshMu.Lock()
-	defer h.tokenRefreshMu.Unlock()
+	mu := h.accountTokenLock(account.ID)
+	mu.Lock()
+	defer mu.Unlock()
 
 	// Another concurrent request may have refreshed this account while we waited.
 	if latest := h.pool.GetByID(account.ID); latest != nil {
@@ -3294,6 +3345,7 @@ func (h *Handler) apiGetStatus(w http.ResponseWriter, r *http.Request) {
 		"dailyTokens":          atomic.LoadInt64(&h.dailyTokens),
 		"dailyCredits":         h.getDailyCredits(),
 		"dailyDate":            time.Now().Format("2006-01-02"),
+		"dailyStatsHistory":    config.GetDailyStatsHistory(),
 		"uptime":               time.Now().Unix() - h.startTime,
 	})
 }
@@ -3429,17 +3481,17 @@ func (h *Handler) apiGetStats(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) apiResetStats(w http.ResponseWriter, r *http.Request) {
-	// 累计统计
-	atomic.StoreInt64(&h.totalRequests, 0)
-	atomic.StoreInt64(&h.successRequests, 0)
-	atomic.StoreInt64(&h.failedRequests, 0)
-	atomic.StoreInt64(&h.totalTokens, 0)
-	h.creditsMu.Lock()
-	h.totalCredits = 0
-	h.creditsMu.Unlock()
-
-	// 今日统计（内存 + 落盘）
+	// 请求统计全部保留：累计计数不清零；今日计数归档后仅重置「当日」展示。
 	h.dailyMu.Lock()
+	date := h.dailyDate
+	if date == "" {
+		date = time.Now().Format("2006-01-02")
+	}
+	req := int(atomic.LoadInt64(&h.dailyRequests))
+	succ := int(atomic.LoadInt64(&h.dailySuccessRequests))
+	fail := int(atomic.LoadInt64(&h.dailyFailedRequests))
+	tok := int(atomic.LoadInt64(&h.dailyTokens))
+	cred := h.dailyCredits
 	atomic.StoreInt64(&h.dailyRequests, 0)
 	atomic.StoreInt64(&h.dailySuccessRequests, 0)
 	atomic.StoreInt64(&h.dailyFailedRequests, 0)
@@ -3448,7 +3500,7 @@ func (h *Handler) apiResetStats(w http.ResponseWriter, r *http.Request) {
 	h.dailyDate = time.Now().Format("2006-01-02")
 	h.dailyMu.Unlock()
 
-	if err := config.UpdateStats(0, 0, 0, 0, 0); err != nil {
+	if err := config.ArchiveDailyStats(date, req, succ, fail, tok, cred); err != nil {
 		w.WriteHeader(500)
 		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 		return
@@ -3458,7 +3510,30 @@ func (h *Handler) apiResetStats(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 		return
 	}
-	json.NewEncoder(w).Encode(map[string]bool{"success": true})
+	// 累计 total* 保持不变并再落盘一次，避免被旧逻辑清零
+	if err := config.UpdateStats(
+		int(atomic.LoadInt64(&h.totalRequests)),
+		int(atomic.LoadInt64(&h.successRequests)),
+		int(atomic.LoadInt64(&h.failedRequests)),
+		int(atomic.LoadInt64(&h.totalTokens)),
+		h.getCredits(),
+	); err != nil {
+		w.WriteHeader(500)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success": true,
+		"message": "daily counters reset; lifetime totals and history preserved",
+		"archived": map[string]interface{}{
+			"date":            date,
+			"requests":        req,
+			"successRequests": succ,
+			"failedRequests":  fail,
+			"tokens":          tok,
+			"credits":         cred,
+		},
+	})
 }
 
 func (h *Handler) apiGetLogs(w http.ResponseWriter, r *http.Request) {

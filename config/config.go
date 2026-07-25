@@ -19,6 +19,7 @@ import (
 	"os"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -237,14 +238,34 @@ type Config struct {
 	TotalTokens     int     `json:"totalTokens,omitempty"`     // Total tokens processed
 	TotalCredits    float64 `json:"totalCredits,omitempty"`    // Total credits consumed
 
-	// Daily statistics (reset at midnight)
+	// Daily statistics (current calendar day; previous days are archived)
 	DailyRequests        int     `json:"dailyRequests,omitempty"`        // Today's total requests
 	DailySuccessRequests int     `json:"dailySuccessRequests,omitempty"` // Today's successful requests
 	DailyFailedRequests  int     `json:"dailyFailedRequests,omitempty"`  // Today's failed requests
 	DailyTokens          int     `json:"dailyTokens,omitempty"`          // Today's total tokens
 	DailyCredits         float64 `json:"dailyCredits,omitempty"`         // Today's total credits consumed
 	DailyDate            string  `json:"dailyDate,omitempty"`            // Current date in YYYY-MM-DD format
+
+	// DailyStatsHistory keeps finalized per-day aggregates so midnight rollover
+	// never discards request statistics. Newest entries are appended; same date
+	// is upserted (takes the larger totals to avoid losing late flushes).
+	DailyStatsHistory []DailyStatsEntry `json:"dailyStatsHistory,omitempty"`
 }
+
+// DailyStatsEntry is one calendar day's finalized request statistics.
+type DailyStatsEntry struct {
+	Date            string  `json:"date"`                 // YYYY-MM-DD
+	Requests        int     `json:"requests"`             // Total requests that day
+	SuccessRequests int     `json:"successRequests"`      // Successful requests
+	FailedRequests  int     `json:"failedRequests"`       // Failed requests
+	Tokens          int     `json:"tokens"`               // Total tokens
+	Credits         float64 `json:"credits"`              // Total credits
+	ArchivedAt      int64   `json:"archivedAt,omitempty"` // Unix seconds when archived/updated
+}
+
+// dailyStatsHistoryMax keeps long-term daily aggregates without unbounded growth.
+// ~3 years is enough for ops review; older rows can still exist if already stored.
+const dailyStatsHistoryMax = 1095
 
 // AccountInfo contains account metadata retrieved from Kiro API.
 // Used for updating subscription and usage information.
@@ -273,6 +294,9 @@ var (
 	cfg     *Config
 	cfgLock sync.RWMutex
 	cfgPath string
+
+	// allowOverUsageCache avoids cfgLock on the hot GetNext path.
+	allowOverUsageCache atomic.Bool
 )
 
 // Init initializes the configuration system with the specified file path.
@@ -282,32 +306,56 @@ func Init(path string) error {
 	return Load()
 }
 
+// Load opens SQLite (default data store), migrates legacy config.json if needed,
+// and hydrates the in-memory cfg cache. Hot path still uses memory; persistence
+// is per-table/per-row via SQLite so 4k+ accounts no longer rewrite a 30MB JSON.
 func Load() error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
 
-	data, err := os.ReadFile(cfgPath)
+	dbFile := resolveDBPath(cfgPath)
+	if err := openDB(dbFile); err != nil {
+		return fmt.Errorf("open database: %w", err)
+	}
+
+	has, err := dbHasData()
 	if err != nil {
-		if os.IsNotExist(err) {
-			// Create default configuration.
-			// Binds to 0.0.0.0 by default for Docker/container compatibility.
-			cfg = &Config{
-				Password:      "changeme",
-				Port:          8080,
-				Host:          "0.0.0.0",
-				RequireApiKey: false,
-				Accounts:      []Account{},
-			}
-			return saveLocked()
-		}
 		return err
 	}
 
-	var c Config
-	if err := json.Unmarshal(data, &c); err != nil {
+	if !has {
+		// Prefer one-time migration from legacy JSON when present.
+		if data, rerr := os.ReadFile(cfgPath); rerr == nil && len(data) > 0 {
+			if err := migrateJSONFileToDB(cfgPath); err != nil {
+				return err
+			}
+		} else if rerr != nil && !os.IsNotExist(rerr) {
+			return rerr
+		} else {
+			// Fresh install: default config into DB.
+			c := defaultConfig()
+			cfg = &c
+			if err := saveToDB(); err != nil {
+				return err
+			}
+		}
+	} else {
+		if err := loadFromDB(); err != nil {
+			return err
+		}
+	}
+
+	if err := applyInMemoryMigrationsLocked(); err != nil {
 		return err
 	}
-	cfg = &c
+	refreshAllowOverUsageCacheLocked()
+	return nil
+}
+
+// applyInMemoryMigrationsLocked runs legacy field promotions after load.
+// Caller must hold cfgLock.
+func applyInMemoryMigrationsLocked() error {
+	dirty := false
 
 	// Migration: if a legacy single ApiKey is present and the new ApiKeys list is empty,
 	// promote it into the new structure. The migrated entry inherits the legacy
@@ -324,9 +372,7 @@ func Load() error {
 			Migrated:  true,
 			CreatedAt: time.Now().Unix(),
 		})
-		if err := saveLocked(); err != nil {
-			return err
-		}
+		dirty = true
 	}
 
 	// Migration: per-account AllowOverage → OverageStatus.
@@ -336,27 +382,22 @@ func Load() error {
 	// previously-allowed accounts on first launch, treat allowOverage=true as
 	// OverageStatus="ENABLED" (operators can refresh from AWS later). The
 	// legacy field is then cleared so future saves don't re-emit it.
-	overageMigrated := false
 	for i := range cfg.Accounts {
 		if cfg.Accounts[i].LegacyAllowOverage {
 			if cfg.Accounts[i].OverageStatus == "" {
 				cfg.Accounts[i].OverageStatus = "ENABLED"
 			}
 			cfg.Accounts[i].LegacyAllowOverage = false
-			overageMigrated = true
+			dirty = true
 		}
 	}
-	if overageMigrated {
-		if err := saveLocked(); err != nil {
-			return err
-		}
+	if dirty {
+		return saveLocked()
 	}
 	return nil
 }
 
-// saveLocked persists cfg to disk. Caller MUST already hold cfgLock.
-// This is identical to Save() (which does not take the lock either) but is named
-// distinctly so call sites that already hold cfgLock are explicit about it.
+// saveLocked persists cfg. Caller MUST already hold cfgLock.
 func saveLocked() error {
 	return Save()
 }
@@ -366,14 +407,50 @@ func newUUID() string {
 	return GenerateMachineId()
 }
 
-// Save persists the current configuration to the JSON file.
-// Uses indented formatting for human readability.
+// Save persists the current configuration.
+// Primary store is SQLite; when the DB is unavailable this is an error
+// (production always opens DB in Load). Tests that call Init still get a DB.
 func Save() error {
+	if useDB() {
+		return saveToDB()
+	}
+	// Fallback JSON path for emergency / partial unit scenarios without openDB.
+	if cfgPath == "" {
+		return errors.New("no config path and no database")
+	}
 	data, err := json.MarshalIndent(cfg, "", "  ")
 	if err != nil {
 		return err
 	}
 	return os.WriteFile(cfgPath, data, 0600)
+}
+
+// saveSettingsLocked writes settings+stats meta only (no account rewrite).
+// Caller holds cfgLock.
+func saveSettingsLocked() error {
+	if useDB() {
+		return dbSaveMeta()
+	}
+	return Save()
+}
+
+// saveStatsLocked writes stats + daily history. Caller holds cfgLock.
+func saveStatsLocked() error {
+	if useDB() {
+		return dbSaveStatsAndHistory()
+	}
+	return Save()
+}
+
+// saveAccountLocked upserts one account. Caller holds cfgLock. idx is the slice index.
+func saveAccountLocked(idx int) error {
+	if idx < 0 || idx >= len(cfg.Accounts) {
+		return errors.New("account index out of range")
+	}
+	if useDB() {
+		return dbUpsertAccount(cfg.Accounts[idx])
+	}
+	return Save()
 }
 
 // SetPassword updates the admin password.
@@ -455,7 +532,13 @@ func GetEnabledAccounts() []Account {
 func AddAccount(account Account) error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
+	if account.ID == "" {
+		account.ID = newUUID()
+	}
 	cfg.Accounts = append(cfg.Accounts, account)
+	if useDB() {
+		return dbUpsertAccount(account)
+	}
 	return Save()
 }
 
@@ -464,7 +547,11 @@ func UpdateAccount(id string, account Account) error {
 	defer cfgLock.Unlock()
 	for i, a := range cfg.Accounts {
 		if a.ID == id {
+			account.ID = id
 			cfg.Accounts[i] = account
+			if useDB() {
+				return dbUpsertAccount(account)
+			}
 			return Save()
 		}
 	}
@@ -490,7 +577,7 @@ func UpdateAccountOverageStatus(id, status, capability string, cap, rate, curren
 			if checkedAt > 0 {
 				cfg.Accounts[i].OverageCheckedAt = checkedAt
 			}
-			return Save()
+			return saveAccountLocked(i)
 		}
 	}
 	return nil
@@ -509,7 +596,7 @@ func SetAccountEnabled(id string, enabled bool) error {
 				cfg.Accounts[i].BanStatus = "DISABLED"
 				cfg.Accounts[i].BanTime = time.Now().Unix()
 			}
-			return Save()
+			return saveAccountLocked(i)
 		}
 	}
 	return nil
@@ -528,7 +615,7 @@ func SetAccountBanStatus(id, status, reason string) error {
 			if status == "BANNED" || status == "DISABLED" {
 				cfg.Accounts[i].Enabled = false
 			}
-			return Save()
+			return saveAccountLocked(i)
 		}
 	}
 	return nil
@@ -540,7 +627,7 @@ func UpdateAccountProfileArn(id, profileArn string) error {
 	for i, a := range cfg.Accounts {
 		if a.ID == id {
 			cfg.Accounts[i].ProfileArn = profileArn
-			return Save()
+			return saveAccountLocked(i)
 		}
 	}
 	return nil
@@ -584,6 +671,16 @@ func DeleteAccounts(ids []string) (int, error) {
 		return 0, nil
 	}
 	cfg.Accounts = kept
+	if useDB() {
+		ids := make([]string, 0, len(idSet))
+		for id := range idSet {
+			ids = append(ids, id)
+		}
+		if err := dbDeleteAccounts(ids); err != nil {
+			return 0, err
+		}
+		return deleted, nil
+	}
 	if err := Save(); err != nil {
 		return 0, err
 	}
@@ -600,7 +697,7 @@ func UpdateAccountToken(id, accessToken, refreshToken string, expiresAt int64) e
 				cfg.Accounts[i].RefreshToken = refreshToken
 			}
 			cfg.Accounts[i].ExpiresAt = expiresAt
-			return Save()
+			return saveAccountLocked(i)
 		}
 	}
 	return nil
@@ -626,7 +723,7 @@ func UpdateSettings(apiKey string, requireApiKey bool, password string) error {
 	if password != "" {
 		cfg.Password = password
 	}
-	return Save()
+	return saveSettingsLocked()
 }
 
 func UpdateSettingsPatch(apiKey *string, requireApiKey *bool, password string) error {
@@ -641,7 +738,7 @@ func UpdateSettingsPatch(apiKey *string, requireApiKey *bool, password string) e
 	if password != "" {
 		cfg.Password = password
 	}
-	return Save()
+	return saveSettingsLocked()
 }
 
 func UpdateStats(totalReq, successReq, failedReq, totalTokens int, totalCredits float64) error {
@@ -652,13 +749,91 @@ func UpdateStats(totalReq, successReq, failedReq, totalTokens int, totalCredits 
 	cfg.FailedRequests = failedReq
 	cfg.TotalTokens = totalTokens
 	cfg.TotalCredits = totalCredits
-	return Save()
+	return saveStatsLocked()
 }
 
 func GetStats() (int, int, int, int, float64) {
 	cfgLock.RLock()
 	defer cfgLock.RUnlock()
 	return cfg.TotalRequests, cfg.SuccessRequests, cfg.FailedRequests, cfg.TotalTokens, cfg.TotalCredits
+}
+
+// archiveDailyStatsLocked stores a finalized day into DailyStatsHistory.
+// Must be called with cfgLock held. Zero-total empty days are still kept so the
+// calendar series remains continuous for operators.
+func archiveDailyStatsLocked(date string, requests, success, failed, tokens int, credits float64) {
+	if date == "" {
+		return
+	}
+	// Prefer the larger totals when the same day is archived more than once
+	// (late flush after rollover, concurrent savers, etc.).
+	entry := DailyStatsEntry{
+		Date:            date,
+		Requests:        requests,
+		SuccessRequests: success,
+		FailedRequests:  failed,
+		Tokens:          tokens,
+		Credits:         credits,
+		ArchivedAt:      time.Now().Unix(),
+	}
+	for i := range cfg.DailyStatsHistory {
+		if cfg.DailyStatsHistory[i].Date != date {
+			continue
+		}
+		prev := cfg.DailyStatsHistory[i]
+		if entry.Requests < prev.Requests {
+			entry.Requests = prev.Requests
+		}
+		if entry.SuccessRequests < prev.SuccessRequests {
+			entry.SuccessRequests = prev.SuccessRequests
+		}
+		if entry.FailedRequests < prev.FailedRequests {
+			entry.FailedRequests = prev.FailedRequests
+		}
+		if entry.Tokens < prev.Tokens {
+			entry.Tokens = prev.Tokens
+		}
+		if entry.Credits < prev.Credits {
+			entry.Credits = prev.Credits
+		}
+		cfg.DailyStatsHistory[i] = entry
+		logger.Infof("[DailyStats] Updated archive for %s: requests=%d success=%d failed=%d tokens=%d credits=%.4f",
+			date, entry.Requests, entry.SuccessRequests, entry.FailedRequests, entry.Tokens, entry.Credits)
+		return
+	}
+	cfg.DailyStatsHistory = append(cfg.DailyStatsHistory, entry)
+	if len(cfg.DailyStatsHistory) > dailyStatsHistoryMax {
+		// Drop oldest while preserving newest window.
+		trim := len(cfg.DailyStatsHistory) - dailyStatsHistoryMax
+		cfg.DailyStatsHistory = append([]DailyStatsEntry(nil), cfg.DailyStatsHistory[trim:]...)
+	}
+	logger.Infof("[DailyStats] Archived %s: requests=%d success=%d failed=%d tokens=%d credits=%.4f (history=%d)",
+		date, entry.Requests, entry.SuccessRequests, entry.FailedRequests, entry.Tokens, entry.Credits, len(cfg.DailyStatsHistory))
+}
+
+// GetDailyStatsHistory returns a copy of archived daily statistics, oldest first.
+func GetDailyStatsHistory() []DailyStatsEntry {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	if cfg == nil || len(cfg.DailyStatsHistory) == 0 {
+		return []DailyStatsEntry{}
+	}
+	out := make([]DailyStatsEntry, len(cfg.DailyStatsHistory))
+	copy(out, cfg.DailyStatsHistory)
+	return out
+}
+
+// ArchiveDailyStats persists one day's finalized totals into DailyStatsHistory.
+// Safe to call from memory day-rollover paths so in-memory counters are not lost
+// even if they exceed the last disk snapshot.
+func ArchiveDailyStats(date string, requests, success, failed, tokens int, credits float64) error {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	if cfg == nil {
+		return errors.New("config not initialized")
+	}
+	archiveDailyStatsLocked(date, requests, success, failed, tokens, credits)
+	return saveLocked()
 }
 
 // UpdateDailyStats updates daily statistics with automatic reset on date change.
@@ -671,9 +846,20 @@ func UpdateDailyStats(dailyReq, dailySuccess, dailyFailed, dailyTokens int, dail
 
 	today := time.Now().Format("2006-01-02")
 
-	if cfg.DailyDate != today {
+	if cfg.DailyDate != "" && cfg.DailyDate != today {
+		// Finalize the previous calendar day before switching the live counters.
+		archiveDailyStatsLocked(
+			cfg.DailyDate,
+			cfg.DailyRequests,
+			cfg.DailySuccessRequests,
+			cfg.DailyFailedRequests,
+			cfg.DailyTokens,
+			cfg.DailyCredits,
+		)
 		logger.Infof("[DailyStats] Day changed from %s to %s, writing new-day stats: requests=%d success=%d failed=%d tokens=%d credits=%.4f",
 			cfg.DailyDate, today, dailyReq, dailySuccess, dailyFailed, dailyTokens, dailyCredits)
+		cfg.DailyDate = today
+	} else if cfg.DailyDate == "" {
 		cfg.DailyDate = today
 	}
 
@@ -682,7 +868,7 @@ func UpdateDailyStats(dailyReq, dailySuccess, dailyFailed, dailyTokens int, dail
 	cfg.DailyFailedRequests = dailyFailed
 	cfg.DailyTokens = dailyTokens
 	cfg.DailyCredits = dailyCredits
-	return Save()
+	return saveStatsLocked()
 }
 
 // AccountRuntimeStats is a minimal stats snapshot for bulk flush.
@@ -723,7 +909,18 @@ func UpdateRuntimeStatsSnapshot(
 	if dailyDate == "" {
 		dailyDate = today
 	}
-	if cfg.DailyDate != dailyDate {
+	if cfg.DailyDate != "" && cfg.DailyDate != dailyDate {
+		// Archive the previous live day before overwriting with the new snapshot.
+		// Callers pass day-aligned counters; the previous day's last known totals
+		// live on cfg until this rollover.
+		archiveDailyStatsLocked(
+			cfg.DailyDate,
+			cfg.DailyRequests,
+			cfg.DailySuccessRequests,
+			cfg.DailyFailedRequests,
+			cfg.DailyTokens,
+			cfg.DailyCredits,
+		)
 		logger.Infof("[DailyStats] Day changed from %s to %s, writing runtime snapshot: requests=%d success=%d failed=%d tokens=%d credits=%.4f",
 			cfg.DailyDate, dailyDate, dailyReq, dailySuccess, dailyFailed, dailyTokens, dailyCredits)
 	}
@@ -759,6 +956,39 @@ func UpdateRuntimeStatsSnapshot(
 		}
 	}
 
+	if useDB() {
+		// Stats/history first, then only the accounts that appear in the snapshot.
+		if err := dbSaveStatsAndHistory(); err != nil {
+			return err
+		}
+		if len(accounts) > 0 {
+			// Re-read updated account structs from cfg by ID
+			toWrite := make([]Account, 0, len(accounts))
+			byID := make(map[string]struct{}, len(accounts))
+			for _, a := range accounts {
+				if a.ID != "" {
+					byID[a.ID] = struct{}{}
+				}
+			}
+			for i := range cfg.Accounts {
+				if _, ok := byID[cfg.Accounts[i].ID]; ok {
+					toWrite = append(toWrite, cfg.Accounts[i])
+				}
+			}
+			if err := dbUpsertAccounts(toWrite); err != nil {
+				return err
+			}
+		}
+		// Deferred API key usage is memory-only until this flush.
+		if len(cfg.ApiKeys) > 0 {
+			for i := range cfg.ApiKeys {
+				if err := dbUpsertApiKey(cfg.ApiKeys[i]); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+	}
 	return saveLocked()
 }
 
@@ -778,7 +1008,9 @@ func GetDailyStats() (int, int, int, int, float64, string) {
 	return cfg.DailyRequests, cfg.DailySuccessRequests, cfg.DailyFailedRequests, cfg.DailyTokens, cfg.DailyCredits, cfg.DailyDate
 }
 
-// ResetDailyStatsIfNeeded checks and resets daily stats at midnight
+// ResetDailyStatsIfNeeded checks and resets daily stats at midnight.
+// Previous day totals are archived into DailyStatsHistory before reset so
+// request statistics are never discarded by the day boundary.
 func ResetDailyStatsIfNeeded() error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
@@ -786,13 +1018,23 @@ func ResetDailyStatsIfNeeded() error {
 	today := time.Now().Format("2006-01-02")
 
 	if cfg.DailyDate != today {
+		if cfg.DailyDate != "" {
+			archiveDailyStatsLocked(
+				cfg.DailyDate,
+				cfg.DailyRequests,
+				cfg.DailySuccessRequests,
+				cfg.DailyFailedRequests,
+				cfg.DailyTokens,
+				cfg.DailyCredits,
+			)
+		}
 		cfg.DailyRequests = 0
 		cfg.DailySuccessRequests = 0
 		cfg.DailyFailedRequests = 0
 		cfg.DailyTokens = 0
 		cfg.DailyCredits = 0
 		cfg.DailyDate = today
-		return Save()
+		return saveStatsLocked()
 	}
 
 	return nil
@@ -808,7 +1050,7 @@ func UpdateAccountStats(id string, requestCount, errorCount, totalTokens int, to
 			cfg.Accounts[i].TotalTokens = totalTokens
 			cfg.Accounts[i].TotalCredits = totalCredits
 			cfg.Accounts[i].LastUsed = lastUsed
-			return Save()
+			return saveAccountLocked(i)
 		}
 	}
 	return nil
@@ -833,7 +1075,7 @@ func UpdateAccountDailyStats(id string, dailyReq, dailyTokens int, dailyCredits 
 			cfg.Accounts[i].DailyRequests = dailyReq
 			cfg.Accounts[i].DailyTokens = dailyTokens
 			cfg.Accounts[i].DailyCredits = dailyCredits
-			return Save()
+			return saveAccountLocked(i)
 		}
 	}
 	return nil
@@ -934,7 +1176,7 @@ func UpdateAccountInfo(id string, info AccountInfo) error {
 			cfg.Accounts[i].TrialUsagePercent = info.TrialUsagePercent
 			cfg.Accounts[i].TrialStatus = info.TrialStatus
 			cfg.Accounts[i].TrialExpiresAt = info.TrialExpiresAt
-			return Save()
+			return saveAccountLocked(i)
 		}
 	}
 	return nil
@@ -1008,7 +1250,7 @@ func UpdatePromptFilterConfig(filterClaudeCode, filterEnvNoise, filterStripBound
 	if rules != nil {
 		cfg.PromptFilterRules = rules
 	}
-	return Save()
+	return saveSettingsLocked()
 }
 
 // GetPromptFilterRules returns the current prompt filter rules.
@@ -1063,7 +1305,7 @@ func UpdateThinkingConfig(suffix, openaiFormat, claudeFormat string) error {
 	cfg.ThinkingSuffix = suffix
 	cfg.OpenAIThinkingFormat = openaiFormat
 	cfg.ClaudeThinkingFormat = claudeFormat
-	return Save()
+	return saveSettingsLocked()
 }
 
 // GetPreferredEndpoint 获取首选端点配置
@@ -1081,7 +1323,7 @@ func UpdatePreferredEndpoint(endpoint string) error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
 	cfg.PreferredEndpoint = endpoint
-	return Save()
+	return saveSettingsLocked()
 }
 
 // GetEndpointFallback returns whether endpoint fallback is enabled. Defaults to true.
@@ -1099,7 +1341,7 @@ func UpdateEndpointFallback(enabled bool) error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
 	cfg.EndpointFallback = &enabled
-	return Save()
+	return saveSettingsLocked()
 }
 
 // GetProxyURL 获取出站代理地址
@@ -1114,17 +1356,21 @@ func UpdateProxySettings(proxyURL string) error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
 	cfg.ProxyURL = proxyURL
-	return Save()
+	return saveSettingsLocked()
 }
 
 // GetAllowOverUsage returns whether over-usage is allowed when account quota is exhausted.
 func GetAllowOverUsage() bool {
-	cfgLock.RLock()
-	defer cfgLock.RUnlock()
+	return allowOverUsageCache.Load()
+}
+
+// refreshAllowOverUsageCacheLocked syncs the atomic cache from cfg. Caller holds cfgLock (any mode).
+func refreshAllowOverUsageCacheLocked() {
 	if cfg == nil {
-		return false
+		allowOverUsageCache.Store(false)
+		return
 	}
-	return cfg.AllowOverUsage
+	allowOverUsageCache.Store(cfg.AllowOverUsage)
 }
 
 // UpdateAllowOverUsage sets the over-usage setting and persists the change.
@@ -1132,7 +1378,8 @@ func UpdateAllowOverUsage(allow bool) error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
 	cfg.AllowOverUsage = allow
-	return Save()
+	refreshAllowOverUsageCacheLocked()
+	return saveSettingsLocked()
 }
 
 // GetShowExhaustedAccounts returns whether to show exhausted accounts in the admin panel.
@@ -1150,23 +1397,23 @@ func UpdateShowExhaustedAccounts(show bool) error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
 	cfg.ShowExhaustedAccounts = &show
-	return Save()
+	return saveSettingsLocked()
 }
 
 // GetMaxInFlightRequests returns the max concurrent heavy generation requests.
-// Default 500 (covers 400 concurrency with headroom). Clamped to 1..10000.
+// Default 4500 (supports >=4000 concurrency with headroom). Clamped to 1..20000.
 func GetMaxInFlightRequests() int {
 	cfgLock.RLock()
 	defer cfgLock.RUnlock()
-	n := 500
+	n := 4500
 	if cfg != nil && cfg.MaxInFlightRequests > 0 {
 		n = cfg.MaxInFlightRequests
 	}
 	if n < 1 {
 		n = 1
 	}
-	if n > 10000 {
-		n = 10000
+	if n > 20000 {
+		n = 20000
 	}
 	return n
 }
@@ -1176,8 +1423,8 @@ func UpdateMaxInFlightRequests(n int) error {
 	if n < 1 {
 		n = 1
 	}
-	if n > 10000 {
-		n = 10000
+	if n > 20000 {
+		n = 20000
 	}
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
@@ -1185,7 +1432,7 @@ func UpdateMaxInFlightRequests(n int) error {
 		return errors.New("config not initialized")
 	}
 	cfg.MaxInFlightRequests = n
-	return Save()
+	return saveSettingsLocked()
 }
 
 // GetBatchTestConcurrency returns admin batch-test concurrency (default 5, clamp 1..200).
@@ -1216,7 +1463,7 @@ func UpdateBatchTestConcurrency(n int) error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
 	cfg.BatchTestConcurrency = n
-	return Save()
+	return saveSettingsLocked()
 }
 
 // GetImportConcurrency returns credential import concurrency (default 100, range 1..200).
@@ -1247,7 +1494,7 @@ func UpdateImportConcurrency(n int) error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
 	cfg.ImportConcurrency = n
-	return Save()
+	return saveSettingsLocked()
 }
 
 // GetLogLevel returns the configured log level (debug/info/warn/error). Defaults to "info".
@@ -1265,7 +1512,7 @@ func UpdateLogLevel(level string) error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
 	cfg.LogLevel = level
-	return Save()
+	return saveSettingsLocked()
 }
 
 type KiroClientConfig struct {

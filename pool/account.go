@@ -21,6 +21,7 @@ type AccountPool struct {
 	cooldowns     map[string]time.Time       // 账号冷却时间
 	errorCounts   map[string]int             // 连续错误计数
 	modelLists    map[string]map[string]bool // accountID → set of modelIDs (from ListAvailableModels)
+	dirty         map[string]struct{}        // accountIDs with stats/token dirty for deferred persist
 }
 
 var (
@@ -65,12 +66,22 @@ func (p *AccountPool) Reload() {
 	p.totalAccounts = len(enabled)
 }
 
+// accountCopy returns a heap copy so callers can mutate freely without racing Reload.
+func accountCopy(a *config.Account) *config.Account {
+	if a == nil {
+		return nil
+	}
+	cp := *a
+	return &cp
+}
+
 // GetNext 获取下一个可用账号（加权轮询）
 func (p *AccountPool) GetNext() *config.Account {
 	return p.GetNextExcluding(nil)
 }
 
 // GetNextExcluding 获取下一个可用账号（加权轮询），并跳过指定账号。
+// 返回账号的堆拷贝，避免 Reload 替换底层 slice 后产生悬空指针竞态。
 func (p *AccountPool) GetNextExcluding(excluded map[string]bool) *config.Account {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
@@ -82,7 +93,8 @@ func (p *AccountPool) GetNextExcluding(excluded map[string]bool) *config.Account
 	allowOverUsage := config.GetAllowOverUsage()
 	now := time.Now()
 	n := len(p.accounts)
-	seen := make(map[string]bool)
+	// 小容量预分配，降低 4k 并发下的 map 分配开销
+	seen := make(map[string]struct{}, 8)
 
 	// 加权轮询查找可用账号
 	for i := 0; i < n; i++ {
@@ -90,32 +102,32 @@ func (p *AccountPool) GetNextExcluding(excluded map[string]bool) *config.Account
 		acc := &p.accounts[idx]
 
 		if excluded != nil && excluded[acc.ID] {
-			seen[acc.ID] = true
+			seen[acc.ID] = struct{}{}
 			continue
 		}
-		if seen[acc.ID] {
+		if _, ok := seen[acc.ID]; ok {
 			continue
 		}
 
 		// 跳过冷却中的账号
 		if cooldown, ok := p.cooldowns[acc.ID]; ok && now.Before(cooldown) {
-			seen[acc.ID] = true
+			seen[acc.ID] = struct{}{}
 			continue
 		}
 
 		// 跳过即将过期的 Token
-		if acc.ExpiresAt > 0 && time.Now().Unix() > acc.ExpiresAt-tokenRefreshSkewSeconds {
-			seen[acc.ID] = true
+		if acc.ExpiresAt > 0 && now.Unix() > acc.ExpiresAt-tokenRefreshSkewSeconds {
+			seen[acc.ID] = struct{}{}
 			continue
 		}
 
 		// Skip accounts whose quota is exhausted, unless overrides apply.
 		if isQuotaBlocked(*acc, allowOverUsage) {
-			seen[acc.ID] = true
+			seen[acc.ID] = struct{}{}
 			continue
 		}
 
-		return acc
+		return accountCopy(acc)
 	}
 
 	// 无可用账号，返回冷却时间最短的（排除额度用尽的，除非允许超额）
@@ -135,10 +147,10 @@ func (p *AccountPool) GetNextExcluding(excluded map[string]bool) *config.Account
 				earliest = cooldown
 			}
 		} else {
-			return acc
+			return accountCopy(acc)
 		}
 	}
-	return best
+	return accountCopy(best)
 }
 
 // SetModelList 缓存账号支持的模型集合（由 handler 在刷新后调用）
@@ -186,6 +198,7 @@ func (p *AccountPool) GetNextForModel(model string) *config.Account {
 }
 
 // GetNextForModelExcluding 获取下一个支持指定模型的可用账号，并跳过指定账号。
+// 返回账号堆拷贝（见 GetNextExcluding）。
 func (p *AccountPool) GetNextForModelExcluding(model string, excluded map[string]bool) *config.Account {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
@@ -197,36 +210,36 @@ func (p *AccountPool) GetNextForModelExcluding(model string, excluded map[string
 	allowOverUsage := config.GetAllowOverUsage()
 	now := time.Now()
 	n := len(p.accounts)
-	seen := make(map[string]bool)
+	seen := make(map[string]struct{}, 8)
 
 	for i := 0; i < n; i++ {
 		idx := atomic.AddUint64(&p.currentIndex, 1) % uint64(n)
 		acc := &p.accounts[idx]
 
 		if excluded != nil && excluded[acc.ID] {
-			seen[acc.ID] = true
+			seen[acc.ID] = struct{}{}
 			continue
 		}
-		if seen[acc.ID] {
+		if _, ok := seen[acc.ID]; ok {
 			continue
 		}
 		if !p.accountHasModel(acc.ID, model) {
-			seen[acc.ID] = true
+			seen[acc.ID] = struct{}{}
 			continue
 		}
 		if cooldown, ok := p.cooldowns[acc.ID]; ok && now.Before(cooldown) {
-			seen[acc.ID] = true
+			seen[acc.ID] = struct{}{}
 			continue
 		}
-		if acc.ExpiresAt > 0 && time.Now().Unix() > acc.ExpiresAt-tokenRefreshSkewSeconds {
-			seen[acc.ID] = true
+		if acc.ExpiresAt > 0 && now.Unix() > acc.ExpiresAt-tokenRefreshSkewSeconds {
+			seen[acc.ID] = struct{}{}
 			continue
 		}
 		if isQuotaBlocked(*acc, allowOverUsage) {
-			seen[acc.ID] = true
+			seen[acc.ID] = struct{}{}
 			continue
 		}
-		return acc
+		return accountCopy(acc)
 	}
 
 	// fallback：找冷却时间最短且支持该模型的账号
@@ -249,10 +262,10 @@ func (p *AccountPool) GetNextForModelExcluding(model string, excluded map[string
 				earliest = cooldown
 			}
 		} else {
-			return acc
+			return accountCopy(acc)
 		}
 	}
-	return best
+	return accountCopy(best)
 }
 
 // GetByID 根据 ID 获取账号
@@ -261,7 +274,7 @@ func (p *AccountPool) GetByID(id string) *config.Account {
 	defer p.mu.RUnlock()
 	for i := range p.accounts {
 		if p.accounts[i].ID == id {
-			return &p.accounts[i]
+			return accountCopy(&p.accounts[i])
 		}
 	}
 	return nil
@@ -385,6 +398,7 @@ func (p *AccountPool) MarkOverLimit(id string) {
 func (p *AccountPool) UpdateToken(id, accessToken, refreshToken string, expiresAt int64) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	updated := false
 	for i := range p.accounts {
 		if p.accounts[i].ID == id {
 			p.accounts[i].AccessToken = accessToken
@@ -392,7 +406,14 @@ func (p *AccountPool) UpdateToken(id, accessToken, refreshToken string, expiresA
 				p.accounts[i].RefreshToken = refreshToken
 			}
 			p.accounts[i].ExpiresAt = expiresAt
+			updated = true
 		}
+	}
+	if updated {
+		if p.dirty == nil {
+			p.dirty = make(map[string]struct{})
+		}
+		p.dirty[id] = struct{}{}
 	}
 }
 
@@ -486,7 +507,48 @@ func (p *AccountPool) UpdateStats(id string, tokens int, credits float64) {
 			p.accounts[i].DailyDate = today
 		}
 	}
-	// 仅更新内存统计；持久化由后台 stats saver 批量 flush。
+	// 仅更新内存统计；标记 dirty，由后台 stats saver 批量 flush。
+	if updated {
+		if p.dirty == nil {
+			p.dirty = make(map[string]struct{})
+		}
+		p.dirty[id] = struct{}{}
+	}
+}
+
+// TakeDirtyAccountStats returns runtime stats for accounts marked dirty since the
+// last take, then clears the dirty set. Used by the background stats saver so we
+// do not rewrite thousands of unchanged account rows every 30s under 4k concurrency.
+func (p *AccountPool) TakeDirtyAccountStats() []config.AccountRuntimeStats {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if len(p.dirty) == 0 {
+		return nil
+	}
+	out := make([]config.AccountRuntimeStats, 0, len(p.dirty))
+	for id := range p.dirty {
+		for i := range p.accounts {
+			if p.accounts[i].ID != id {
+				continue
+			}
+			a := p.accounts[i]
+			out = append(out, config.AccountRuntimeStats{
+				ID:            a.ID,
+				RequestCount:  a.RequestCount,
+				ErrorCount:    a.ErrorCount,
+				LastUsed:      a.LastUsed,
+				TotalTokens:   a.TotalTokens,
+				TotalCredits:  a.TotalCredits,
+				DailyRequests: a.DailyRequests,
+				DailyTokens:   a.DailyTokens,
+				DailyCredits:  a.DailyCredits,
+				DailyDate:     a.DailyDate,
+			})
+			break
+		}
+	}
+	p.dirty = make(map[string]struct{}, len(p.dirty))
+	return out
 }
 
 // GetAllAccounts 获取所有账号副本

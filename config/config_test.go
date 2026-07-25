@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func TestUpdateSettingsPatchPreservesOmittedAPIKeyFields(t *testing.T) {
@@ -109,21 +110,14 @@ func TestAccountAllowOverageMigration(t *testing.T) {
 		t.Fatalf("expected legacy field to still be cleared on acc-already-set")
 	}
 
-	// Re-read the file and confirm legacy field is gone (so it doesn't drift
+	// Re-load from SQLite and confirm legacy field is gone (so it doesn't drift
 	// back in on later saves).
-	on_disk, err := os.ReadFile(cfgFile)
-	if err != nil {
-		t.Fatalf("read back: %v", err)
+	if err := Load(); err != nil {
+		t.Fatalf("reload: %v", err)
 	}
-	var reloaded struct {
-		Accounts []map[string]interface{} `json:"accounts"`
-	}
-	if err := json.Unmarshal(on_disk, &reloaded); err != nil {
-		t.Fatalf("decode reload: %v", err)
-	}
-	for _, a := range reloaded.Accounts {
-		if _, ok := a["allowOverage"]; ok {
-			t.Fatalf("expected allowOverage to be omitted from persisted file, got %+v", a)
+	for _, a := range GetAccounts() {
+		if a.LegacyAllowOverage {
+			t.Fatalf("expected allowOverage cleared after persist, got %+v", a)
 		}
 	}
 }
@@ -132,8 +126,8 @@ func TestGetMaxInFlightRequestsDefaultAndClamp(t *testing.T) {
 	if err := Init(filepath.Join(t.TempDir(), "config.json")); err != nil {
 		t.Fatalf("init: %v", err)
 	}
-	if got := GetMaxInFlightRequests(); got != 500 {
-		t.Fatalf("default MaxInFlightRequests = %d, want 500", got)
+	if got := GetMaxInFlightRequests(); got != 4500 {
+		t.Fatalf("default MaxInFlightRequests = %d, want 4500", got)
 	}
 	if err := UpdateMaxInFlightRequests(400); err != nil {
 		t.Fatalf("update 400: %v", err)
@@ -147,11 +141,11 @@ func TestGetMaxInFlightRequestsDefaultAndClamp(t *testing.T) {
 	if got := GetMaxInFlightRequests(); got != 1 {
 		t.Fatalf("clamp low got %d, want 1", got)
 	}
-	if err := UpdateMaxInFlightRequests(20000); err != nil {
-		t.Fatalf("update 20000: %v", err)
+	if err := UpdateMaxInFlightRequests(50000); err != nil {
+		t.Fatalf("update 50000: %v", err)
 	}
-	if got := GetMaxInFlightRequests(); got != 10000 {
-		t.Fatalf("clamp high got %d, want 10000", got)
+	if got := GetMaxInFlightRequests(); got != 20000 {
+		t.Fatalf("clamp high got %d, want 20000", got)
 	}
 }
 
@@ -216,5 +210,88 @@ func TestUpdateRuntimeStatsSnapshotPreservesNonStatsFields(t *testing.T) {
 	dReq, dSucc, dFail, dTok, dCred, dDate := GetDailyStats()
 	if dReq != 20 || dSucc != 18 || dFail != 2 || dTok != 200 || dCred != 3.5 || dDate != today {
 		t.Fatalf("daily stats mismatch: %d %d %d %d %v %s", dReq, dSucc, dFail, dTok, dCred, dDate)
+	}
+}
+
+func TestDailyStatsHistoryArchiveOnDayChange(t *testing.T) {
+	dir := t.TempDir()
+	cfgFile := filepath.Join(dir, "config.json")
+	if err := Init(cfgFile); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+
+	// Seed "yesterday" as the live daily counters.
+	yesterday := time.Now().Add(-24 * time.Hour).Format("2006-01-02")
+	cfgLock.Lock()
+	cfg.DailyDate = yesterday
+	cfg.DailyRequests = 100
+	cfg.DailySuccessRequests = 80
+	cfg.DailyFailedRequests = 20
+	cfg.DailyTokens = 1000
+	cfg.DailyCredits = 5.5
+	cfgLock.Unlock()
+
+	// Writing today's stats must archive yesterday instead of discarding it.
+	if err := UpdateDailyStats(3, 2, 1, 30, 0.5); err != nil {
+		t.Fatalf("UpdateDailyStats: %v", err)
+	}
+
+	hist := GetDailyStatsHistory()
+	if len(hist) != 1 {
+		t.Fatalf("expected 1 history entry, got %d: %+v", len(hist), hist)
+	}
+	e := hist[0]
+	if e.Date != yesterday {
+		t.Fatalf("date=%q want %q", e.Date, yesterday)
+	}
+	if e.Requests != 100 || e.SuccessRequests != 80 || e.FailedRequests != 20 || e.Tokens != 1000 || e.Credits != 5.5 {
+		t.Fatalf("archived entry mismatch: %+v", e)
+	}
+
+	dReq, dSucc, dFail, dTok, dCred, dDate := GetDailyStats()
+	today := time.Now().Format("2006-01-02")
+	if dDate != today || dReq != 3 || dSucc != 2 || dFail != 1 || dTok != 30 || dCred != 0.5 {
+		t.Fatalf("live daily mismatch: %d %d %d %d %v %s", dReq, dSucc, dFail, dTok, dCred, dDate)
+	}
+
+	// Lifetime totals are independent and must not be touched by daily archive.
+	if err := UpdateStats(50, 40, 10, 500, 9); err != nil {
+		t.Fatalf("UpdateStats: %v", err)
+	}
+	tr, sr, fr, tt, tc := GetStats()
+	if tr != 50 || sr != 40 || fr != 10 || tt != 500 || tc != 9 {
+		t.Fatalf("lifetime stats changed: %d %d %d %d %v", tr, sr, fr, tt, tc)
+	}
+}
+
+func TestArchiveDailyStatsUpsertsMax(t *testing.T) {
+	dir := t.TempDir()
+	cfgFile := filepath.Join(dir, "config.json")
+	if err := Init(cfgFile); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+
+	date := "2026-07-20"
+	if err := ArchiveDailyStats(date, 10, 7, 3, 100, 1.0); err != nil {
+		t.Fatalf("archive1: %v", err)
+	}
+	// Smaller second write must not shrink the archived totals.
+	if err := ArchiveDailyStats(date, 5, 1, 1, 10, 0.1); err != nil {
+		t.Fatalf("archive2: %v", err)
+	}
+	hist := GetDailyStatsHistory()
+	if len(hist) != 1 {
+		t.Fatalf("expected 1 entry, got %d", len(hist))
+	}
+	if hist[0].Requests != 10 || hist[0].SuccessRequests != 7 || hist[0].FailedRequests != 3 {
+		t.Fatalf("max upsert failed: %+v", hist[0])
+	}
+	// Larger write expands.
+	if err := ArchiveDailyStats(date, 12, 8, 4, 120, 1.2); err != nil {
+		t.Fatalf("archive3: %v", err)
+	}
+	hist = GetDailyStatsHistory()
+	if hist[0].Requests != 12 || hist[0].Tokens != 120 {
+		t.Fatalf("expand failed: %+v", hist[0])
 	}
 }

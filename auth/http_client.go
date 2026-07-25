@@ -44,9 +44,9 @@ func GetAuthClientForProxy(proxyURL string) *http.Client {
 // buildAuthTransport 构建带可选代理的 Transport
 func buildAuthTransport(proxyURL string) *http.Transport {
 	t := &http.Transport{
-		MaxIdleConns:        256,
-		MaxIdleConnsPerHost: 128,
-		IdleConnTimeout:     90 * time.Second,
+		MaxIdleConns:        1024,
+		MaxIdleConnsPerHost: 512,
+		IdleConnTimeout:     120 * time.Second,
 		DisableCompression:  false,
 		ForceAttemptHTTP2:   true,
 	}

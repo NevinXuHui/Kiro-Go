@@ -42,9 +42,12 @@ func main() {
 		log.Fatalf("Failed to create data directory: %v", err)
 	}
 
-	// 加载配置
+	// 加载配置（SQLite 为主存储；若存在 legacy config.json 会自动迁移）
 	if err := config.Init(configPath); err != nil {
 		log.Fatalf("Failed to load config: %v", err)
+	}
+	if dbPath := config.GetDatabasePath(); dbPath != "" {
+		log.Printf("Database: %s", dbPath)
 	}
 
 	// Initialize log level: LOG_LEVEL env var takes priority over config, defaulting to "info".
@@ -112,5 +115,6 @@ func main() {
 	if err := handler.Close(); err != nil {
 		logger.Warnf("Handler close: %v", err)
 	}
+	config.CloseStore()
 	logger.Infof("Shutdown complete")
 }

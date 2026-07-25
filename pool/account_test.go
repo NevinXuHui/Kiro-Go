@@ -348,7 +348,11 @@ func TestUpdateStatsMemoryOnlyNoImmediatePersist(t *testing.T) {
 		modelLists:  make(map[string]map[string]bool),
 	}
 
-	before, err := os.Stat(cfgFile)
+	dbFile := config.GetDatabasePath()
+	if dbFile == "" {
+		t.Fatal("expected sqlite database path")
+	}
+	before, err := os.Stat(dbFile)
 	if err != nil {
 		t.Fatalf("stat: %v", err)
 	}
@@ -364,11 +368,39 @@ func TestUpdateStatsMemoryOnlyNoImmediatePersist(t *testing.T) {
 		}
 	}
 
-	after, err := os.Stat(cfgFile)
+	after, err := os.Stat(dbFile)
 	if err != nil {
 		t.Fatalf("stat after: %v", err)
 	}
 	if after.ModTime().After(before.ModTime()) {
 		t.Fatalf("UpdateStats should not persist config immediately")
+	}
+}
+
+func TestTakeDirtyAccountStatsOnlyReturnsChanged(t *testing.T) {
+	cfgFile := filepath.Join(t.TempDir(), "config.json")
+	if err := config.Init(cfgFile); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	if err := config.AddAccount(config.Account{ID: "d1", Enabled: true, AccessToken: "t"}); err != nil {
+		t.Fatalf("add: %v", err)
+	}
+	if err := config.AddAccount(config.Account{ID: "d2", Enabled: true, AccessToken: "t"}); err != nil {
+		t.Fatalf("add2: %v", err)
+	}
+	p := GetPool()
+	p.Reload()
+	// no dirty yet
+	if got := p.TakeDirtyAccountStats(); len(got) != 0 {
+		t.Fatalf("expected empty dirty, got %d", len(got))
+	}
+	p.UpdateStats("d1", 10, 0.1)
+	got := p.TakeDirtyAccountStats()
+	if len(got) != 1 || got[0].ID != "d1" || got[0].TotalTokens != 10 {
+		t.Fatalf("dirty snapshot: %+v", got)
+	}
+	// second take should be empty
+	if got := p.TakeDirtyAccountStats(); len(got) != 0 {
+		t.Fatalf("expected cleared dirty, got %+v", got)
 	}
 }
