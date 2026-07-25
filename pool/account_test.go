@@ -404,3 +404,93 @@ func TestTakeDirtyAccountStatsOnlyReturnsChanged(t *testing.T) {
 		t.Fatalf("expected cleared dirty, got %+v", got)
 	}
 }
+
+
+func TestNewAccountFirstUseIntervalSerializesVirgins(t *testing.T) {
+	p := &AccountPool{
+		firstUseStarted: make(map[string]struct{}),
+	}
+	// Two never-used imported accounts.
+	p.accounts = []config.Account{
+		{ID: "new-a", AccessToken: "t", Enabled: true},
+		{ID: "new-b", AccessToken: "t", Enabled: true},
+	}
+
+	first := p.GetNext()
+	if first == nil {
+		t.Fatal("expected first virgin account")
+	}
+	// Immediately after, only the already-claimed virgin may be selected again;
+	// the other virgin must wait for the global first-use interval.
+	ids := map[string]int{}
+	for i := 0; i < 20; i++ {
+		acc := p.GetNext()
+		if acc == nil {
+			t.Fatalf("iteration %d: expected claimed virgin still selectable", i)
+		}
+		if acc.ID != first.ID {
+			t.Fatalf("iteration %d: got second virgin %q too early; want only %q", i, acc.ID, first.ID)
+		}
+		ids[acc.ID]++
+	}
+	if len(ids) != 1 {
+		t.Fatalf("expected single active first-use account, got %v", ids)
+	}
+
+	// After the interval, the other virgin may be claimed.
+	p.mu.Lock()
+	p.nextNewFirstUseAt = time.Now().Add(-time.Second)
+	p.mu.Unlock()
+
+	// Mark first as used so pass-1 still has a non-virgin, then force only virgins
+	// by excluding the used one — second virgin should now be claimable.
+	p.mu.Lock()
+	for i := range p.accounts {
+		if p.accounts[i].ID == first.ID {
+			p.accounts[i].RequestCount = 1
+			p.accounts[i].LastUsed = time.Now().Unix()
+		}
+	}
+	p.mu.Unlock()
+
+	second := p.GetNextExcluding(map[string]bool{first.ID: true})
+	if second == nil {
+		t.Fatal("expected second virgin after interval")
+	}
+	if second.ID == first.ID {
+		t.Fatalf("expected the other virgin, got %q again", second.ID)
+	}
+}
+
+func TestNewAccountFirstUsePrefersExperiencedAccounts(t *testing.T) {
+	p := &AccountPool{firstUseStarted: make(map[string]struct{})}
+	p.accounts = []config.Account{
+		{ID: "used", AccessToken: "t", RequestCount: 5, LastUsed: time.Now().Unix()},
+		{ID: "new", AccessToken: "t"},
+	}
+	for i := 0; i < 10; i++ {
+		acc := p.GetNext()
+		if acc == nil {
+			t.Fatal("expected account")
+		}
+		if acc.ID != "used" {
+			t.Fatalf("expected experienced account preferred over virgin, got %q", acc.ID)
+		}
+	}
+}
+
+func TestNewAccountFirstUseAllowsOnlyVirginWhenNoExperienced(t *testing.T) {
+	p := &AccountPool{firstUseStarted: make(map[string]struct{})}
+	p.accounts = []config.Account{
+		{ID: "only-new", AccessToken: "t"},
+	}
+	acc := p.GetNext()
+	if acc == nil || acc.ID != "only-new" {
+		t.Fatalf("expected only virgin to be claimable, got %+v", acc)
+	}
+	// Within interval, same claimed virgin remains available.
+	again := p.GetNext()
+	if again == nil || again.ID != "only-new" {
+		t.Fatalf("expected claimed virgin reusable, got %+v", again)
+	}
+}

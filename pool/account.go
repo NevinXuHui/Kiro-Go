@@ -12,6 +12,9 @@ import (
 
 const tokenRefreshSkewSeconds int64 = 120
 
+// defaultNewAccountFirstUseInterval is used only if config is unavailable.
+const defaultNewAccountFirstUseInterval = time.Minute
+
 // AccountPool 账号池
 type AccountPool struct {
 	mu            sync.RWMutex
@@ -22,6 +25,12 @@ type AccountPool struct {
 	errorCounts   map[string]int             // 连续错误计数
 	modelLists    map[string]map[string]bool // accountID → set of modelIDs (from ListAvailableModels)
 	dirty         map[string]struct{}        // accountIDs with stats/token dirty for deferred persist
+
+	// firstUseStarted marks accounts that already claimed their "first use" slot
+	// this process lifetime (survives Reload until stats show real usage).
+	firstUseStarted map[string]struct{}
+	// nextNewFirstUseAt is the earliest time another virgin account may be claimed.
+	nextNewFirstUseAt time.Time
 }
 
 var (
@@ -33,9 +42,10 @@ var (
 func GetPool() *AccountPool {
 	poolOnce.Do(func() {
 		pool = &AccountPool{
-			cooldowns:   make(map[string]time.Time),
-			errorCounts: make(map[string]int),
-			modelLists:  make(map[string]map[string]bool),
+			cooldowns:       make(map[string]time.Time),
+			errorCounts:     make(map[string]int),
+			modelLists:      make(map[string]map[string]bool),
+			firstUseStarted: make(map[string]struct{}),
 		}
 		pool.Reload()
 	})
@@ -75,17 +85,54 @@ func accountCopy(a *config.Account) *config.Account {
 	return &cp
 }
 
-// GetNext 获取下一个可用账号（加权轮询）
-func (p *AccountPool) GetNext() *config.Account {
-	return p.GetNextExcluding(nil)
+// isVirginAccount reports whether the account has never completed a generation
+// request and has not yet claimed a first-use slot in this process.
+// Caller must hold p.mu (read or write).
+func (p *AccountPool) isVirginAccount(acc *config.Account) bool {
+	if acc == nil {
+		return false
+	}
+	if acc.RequestCount > 0 || acc.LastUsed > 0 {
+		return false
+	}
+	if p.firstUseStarted != nil {
+		if _, ok := p.firstUseStarted[acc.ID]; ok {
+			return false
+		}
+	}
+	return true
 }
 
-// GetNextExcluding 获取下一个可用账号（加权轮询），并跳过指定账号。
-// 返回账号的堆拷贝，避免 Reload 替换底层 slice 后产生悬空指针竞态。
-func (p *AccountPool) GetNextExcluding(excluded map[string]bool) *config.Account {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
+// claimVirginFirstUseLocked reserves the global first-use slot for acc.
+// Caller must hold p.mu for writing. Returns false if another virgin was
+// claimed too recently.
+func (p *AccountPool) claimVirginFirstUseLocked(acc *config.Account, now time.Time) bool {
+	if acc == nil {
+		return false
+	}
+	if !p.isVirginAccount(acc) {
+		return true
+	}
+	if !p.nextNewFirstUseAt.IsZero() && now.Before(p.nextNewFirstUseAt) {
+		return false
+	}
+	if p.firstUseStarted == nil {
+		p.firstUseStarted = make(map[string]struct{})
+	}
+	p.firstUseStarted[acc.ID] = struct{}{}
+	interval := config.GetNewAccountFirstUseInterval()
+	if interval <= 0 {
+		interval = defaultNewAccountFirstUseInterval
+	}
+	p.nextNewFirstUseAt = now.Add(interval)
+	return true
+}
 
+// selectAccountLocked picks the next account. model=="" disables model filter.
+// Prefers already-used accounts; virgin (never-used) accounts are gated so at
+// most one new account starts its first use per configured first-use interval.
+// Caller must hold p.mu for writing (needed to claim virgin first-use).
+func (p *AccountPool) selectAccountLocked(excluded map[string]bool, model string) *config.Account {
 	if len(p.accounts) == 0 {
 		return nil
 	}
@@ -93,44 +140,63 @@ func (p *AccountPool) GetNextExcluding(excluded map[string]bool) *config.Account
 	allowOverUsage := config.GetAllowOverUsage()
 	now := time.Now()
 	n := len(p.accounts)
-	// 小容量预分配，降低 4k 并发下的 map 分配开销
 	seen := make(map[string]struct{}, 8)
 
-	// 加权轮询查找可用账号
-	for i := 0; i < n; i++ {
-		idx := atomic.AddUint64(&p.currentIndex, 1) % uint64(n)
-		acc := &p.accounts[idx]
+	tryPick := func(allowVirgin bool) *config.Account {
+		for i := 0; i < n; i++ {
+			idx := atomic.AddUint64(&p.currentIndex, 1) % uint64(n)
+			acc := &p.accounts[idx]
 
-		if excluded != nil && excluded[acc.ID] {
-			seen[acc.ID] = struct{}{}
-			continue
-		}
-		if _, ok := seen[acc.ID]; ok {
-			continue
-		}
+			if excluded != nil && excluded[acc.ID] {
+				seen[acc.ID] = struct{}{}
+				continue
+			}
+			if _, ok := seen[acc.ID]; ok {
+				continue
+			}
+			if model != "" && !p.accountHasModel(acc.ID, model) {
+				seen[acc.ID] = struct{}{}
+				continue
+			}
+			if cooldown, ok := p.cooldowns[acc.ID]; ok && now.Before(cooldown) {
+				seen[acc.ID] = struct{}{}
+				continue
+			}
+			if acc.ExpiresAt > 0 && now.Unix() > acc.ExpiresAt-tokenRefreshSkewSeconds {
+				seen[acc.ID] = struct{}{}
+				continue
+			}
+			if isQuotaBlocked(*acc, allowOverUsage) {
+				seen[acc.ID] = struct{}{}
+				continue
+			}
 
-		// 跳过冷却中的账号
-		if cooldown, ok := p.cooldowns[acc.ID]; ok && now.Before(cooldown) {
-			seen[acc.ID] = struct{}{}
-			continue
+			virgin := p.isVirginAccount(acc)
+			if virgin && !allowVirgin {
+				seen[acc.ID] = struct{}{}
+				continue
+			}
+			if virgin && !p.claimVirginFirstUseLocked(acc, now) {
+				seen[acc.ID] = struct{}{}
+				continue
+			}
+			return accountCopy(acc)
 		}
-
-		// 跳过即将过期的 Token
-		if acc.ExpiresAt > 0 && now.Unix() > acc.ExpiresAt-tokenRefreshSkewSeconds {
-			seen[acc.ID] = struct{}{}
-			continue
-		}
-
-		// Skip accounts whose quota is exhausted, unless overrides apply.
-		if isQuotaBlocked(*acc, allowOverUsage) {
-			seen[acc.ID] = struct{}{}
-			continue
-		}
-
-		return accountCopy(acc)
+		return nil
 	}
 
-	// 无可用账号，返回冷却时间最短的（排除额度用尽的，除非允许超额）
+	// Pass 1: already-used / previously claimed accounts only.
+	clear(seen)
+	if acc := tryPick(false); acc != nil {
+		return acc
+	}
+	// Pass 2: allow one virgin first-use if the global interval permits.
+	clear(seen)
+	if acc := tryPick(true); acc != nil {
+		return acc
+	}
+
+	// Fallback: earliest-cooldown non-virgin (never force a gated virgin here).
 	var best *config.Account
 	var earliest time.Time
 	for i := range p.accounts {
@@ -138,7 +204,13 @@ func (p *AccountPool) GetNextExcluding(excluded map[string]bool) *config.Account
 		if excluded != nil && excluded[acc.ID] {
 			continue
 		}
+		if model != "" && !p.accountHasModel(acc.ID, model) {
+			continue
+		}
 		if isQuotaBlocked(*acc, allowOverUsage) {
+			continue
+		}
+		if p.isVirginAccount(acc) {
 			continue
 		}
 		if cooldown, ok := p.cooldowns[acc.ID]; ok {
@@ -151,6 +223,20 @@ func (p *AccountPool) GetNextExcluding(excluded map[string]bool) *config.Account
 		}
 	}
 	return accountCopy(best)
+}
+
+// GetNext 获取下一个可用账号（加权轮询）
+func (p *AccountPool) GetNext() *config.Account {
+	return p.GetNextExcluding(nil)
+}
+
+// GetNextExcluding 获取下一个可用账号（加权轮询），并跳过指定账号。
+// 返回账号的堆拷贝，避免 Reload 替换底层 slice 后产生悬空指针竞态。
+// 从未使用过的新账号首次调度受 NewAccountFirstUseInterval 全局间隔限制。
+func (p *AccountPool) GetNextExcluding(excluded map[string]bool) *config.Account {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.selectAccountLocked(excluded, "")
 }
 
 // SetModelList 缓存账号支持的模型集合（由 handler 在刷新后调用）
@@ -199,73 +285,11 @@ func (p *AccountPool) GetNextForModel(model string) *config.Account {
 
 // GetNextForModelExcluding 获取下一个支持指定模型的可用账号，并跳过指定账号。
 // 返回账号堆拷贝（见 GetNextExcluding）。
+// 从未使用过的新账号首次调度受 NewAccountFirstUseInterval 全局间隔限制。
 func (p *AccountPool) GetNextForModelExcluding(model string, excluded map[string]bool) *config.Account {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-
-	if len(p.accounts) == 0 {
-		return nil
-	}
-
-	allowOverUsage := config.GetAllowOverUsage()
-	now := time.Now()
-	n := len(p.accounts)
-	seen := make(map[string]struct{}, 8)
-
-	for i := 0; i < n; i++ {
-		idx := atomic.AddUint64(&p.currentIndex, 1) % uint64(n)
-		acc := &p.accounts[idx]
-
-		if excluded != nil && excluded[acc.ID] {
-			seen[acc.ID] = struct{}{}
-			continue
-		}
-		if _, ok := seen[acc.ID]; ok {
-			continue
-		}
-		if !p.accountHasModel(acc.ID, model) {
-			seen[acc.ID] = struct{}{}
-			continue
-		}
-		if cooldown, ok := p.cooldowns[acc.ID]; ok && now.Before(cooldown) {
-			seen[acc.ID] = struct{}{}
-			continue
-		}
-		if acc.ExpiresAt > 0 && now.Unix() > acc.ExpiresAt-tokenRefreshSkewSeconds {
-			seen[acc.ID] = struct{}{}
-			continue
-		}
-		if isQuotaBlocked(*acc, allowOverUsage) {
-			seen[acc.ID] = struct{}{}
-			continue
-		}
-		return accountCopy(acc)
-	}
-
-	// fallback：找冷却时间最短且支持该模型的账号
-	var best *config.Account
-	var earliest time.Time
-	for i := range p.accounts {
-		acc := &p.accounts[i]
-		if excluded != nil && excluded[acc.ID] {
-			continue
-		}
-		if !p.accountHasModel(acc.ID, model) {
-			continue
-		}
-		if isQuotaBlocked(*acc, allowOverUsage) {
-			continue
-		}
-		if cooldown, ok := p.cooldowns[acc.ID]; ok {
-			if best == nil || cooldown.Before(earliest) {
-				best = acc
-				earliest = cooldown
-			}
-		} else {
-			return accountCopy(acc)
-		}
-	}
-	return accountCopy(best)
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.selectAccountLocked(excluded, model)
 }
 
 // GetByID 根据 ID 获取账号

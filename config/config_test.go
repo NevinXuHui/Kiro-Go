@@ -355,3 +355,28 @@ func TestResetAllStatsClearsLifetimeAndHistory(t *testing.T) {
 		t.Fatalf("account runtime stats not cleared: %+v", a)
 	}
 }
+
+
+func TestNewAccountFirstUseIntervalConfig(t *testing.T) {
+	dir := t.TempDir()
+	if err := Init(filepath.Join(dir, "config.json")); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	t.Cleanup(CloseStore)
+	if got := GetNewAccountFirstUseInterval(); got != 60*time.Second {
+		t.Fatalf("default=%v want 60s", got)
+	}
+	if err := UpdateNewAccountFirstUseIntervalSec(120); err != nil {
+		t.Fatalf("update: %v", err)
+	}
+	if got := GetNewAccountFirstUseInterval(); got != 120*time.Second {
+		t.Fatalf("got=%v want 120s", got)
+	}
+	if err := UpdateNewAccountFirstUseIntervalSec(0); err != nil {
+		t.Fatalf("update0: %v", err)
+	}
+	// 0 clamps to 1
+	if got := GetNewAccountFirstUseInterval(); got != time.Second {
+		t.Fatalf("clamp low got=%v want 1s", got)
+	}
+}

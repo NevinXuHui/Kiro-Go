@@ -2292,6 +2292,13 @@
         Number.isFinite(maxInFlight) && maxInFlight > 0 ? Math.min(20000, Math.max(1, maxInFlight)) : 4500
       );
     }
+    const firstUseSec = parseInt(d.newAccountFirstUseIntervalSec, 10);
+    const firstUseInput = $('newAccountFirstUseIntervalSec');
+    if (firstUseInput) {
+      firstUseInput.value = String(
+        Number.isFinite(firstUseSec) && firstUseSec > 0 ? Math.min(3600, Math.max(1, firstUseSec)) : 60
+      );
+    }
     await Promise.all([loadThinkingConfig(), loadEndpointConfig(), loadProxyConfig(), loadPromptFilter(), loadApiKeys()]);
     refreshCustomSelects();
   }
@@ -2413,6 +2420,11 @@
       toast(t('settings.maxInFlightRequestsInvalid'), 'warning');
       return;
     }
+    const rawFirstUseSec = parseInt(($('newAccountFirstUseIntervalSec') && $('newAccountFirstUseIntervalSec').value) || '60', 10);
+    if (!Number.isFinite(rawFirstUseSec) || rawFirstUseSec < 1 || rawFirstUseSec > 3600) {
+      toast(t('settings.newAccountFirstUseIntervalInvalid'), 'warning');
+      return;
+    }
     await api('/settings', {
       method: 'POST',
       body: JSON.stringify({
@@ -2420,7 +2432,8 @@
         showExhaustedAccounts: showExhaustedAccountsValue,
         batchTestConcurrency: rawConc,
         importConcurrency: rawImportConc,
-        maxInFlightRequests: rawMaxInFlight
+        maxInFlightRequests: rawMaxInFlight,
+        newAccountFirstUseIntervalSec: rawFirstUseSec
       })
     });
     showExhaustedAccounts = showExhaustedAccountsValue;

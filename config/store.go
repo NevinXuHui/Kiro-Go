@@ -287,7 +287,8 @@ type settingsBlob struct {
 	ShowExhaustedAccounts    *bool              `json:"showExhaustedAccounts,omitempty"`
 	BatchTestConcurrency     int                `json:"batchTestConcurrency,omitempty"`
 	ImportConcurrency        int                `json:"importConcurrency,omitempty"`
-	MaxInFlightRequests      int                `json:"maxInFlightRequests,omitempty"`
+	MaxInFlightRequests             int                `json:"maxInFlightRequests,omitempty"`
+	NewAccountFirstUseIntervalSec   int                `json:"newAccountFirstUseIntervalSec,omitempty"`
 	ProxyURL                 string             `json:"proxyURL,omitempty"`
 	FilterClaudeCode         bool               `json:"filterClaudeCode,omitempty"`
 	FilterEnvNoise           bool               `json:"filterEnvNoise,omitempty"`
@@ -316,7 +317,8 @@ func settingsFromConfig(c *Config) settingsBlob {
 		ShowExhaustedAccounts:    c.ShowExhaustedAccounts,
 		BatchTestConcurrency:     c.BatchTestConcurrency,
 		ImportConcurrency:        c.ImportConcurrency,
-		MaxInFlightRequests:      c.MaxInFlightRequests,
+		MaxInFlightRequests:           c.MaxInFlightRequests,
+		NewAccountFirstUseIntervalSec: c.NewAccountFirstUseIntervalSec,
 		ProxyURL:                 c.ProxyURL,
 		FilterClaudeCode:         c.FilterClaudeCode,
 		FilterEnvNoise:           c.FilterEnvNoise,
@@ -352,6 +354,7 @@ func (s settingsBlob) apply(c *Config) {
 	c.BatchTestConcurrency = s.BatchTestConcurrency
 	c.ImportConcurrency = s.ImportConcurrency
 	c.MaxInFlightRequests = s.MaxInFlightRequests
+	c.NewAccountFirstUseIntervalSec = s.NewAccountFirstUseIntervalSec
 	c.ProxyURL = s.ProxyURL
 	c.FilterClaudeCode = s.FilterClaudeCode
 	c.FilterEnvNoise = s.FilterEnvNoise

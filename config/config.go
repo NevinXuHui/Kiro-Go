@@ -203,6 +203,11 @@ type Config struct {
 	// request limiter so admin changes apply without restart.
 	MaxInFlightRequests int `json:"maxInFlightRequests,omitempty"`
 
+	// NewAccountFirstUseIntervalSec is the minimum gap (seconds) between first-use
+	// activation of two never-used imported accounts. Defaults to 60.
+	// Clamped to 1..3600. Live-read by the account pool (admin changes apply live).
+	NewAccountFirstUseIntervalSec int `json:"newAccountFirstUseIntervalSec,omitempty"`
+
 	// Proxy configuration: optional outbound proxy for Kiro API requests
 	// Format: "socks5://host:port", "socks5://user:pass@host:port",
 	//         "http://host:port",  "http://user:pass@host:port"
@@ -289,7 +294,7 @@ type AccountInfo struct {
 }
 
 // Version current version
-const Version = "1.3.3"
+const Version = "1.3.4"
 
 var (
 	cfg     *Config
@@ -1473,6 +1478,42 @@ func UpdateMaxInFlightRequests(n int) error {
 		return errors.New("config not initialized")
 	}
 	cfg.MaxInFlightRequests = n
+	return saveSettingsLocked()
+}
+
+// GetNewAccountFirstUseInterval returns the minimum wait between first-use of
+// two virgin (never-used) accounts. Default 60s. Clamped to 1..3600 seconds.
+func GetNewAccountFirstUseInterval() time.Duration {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	n := 60
+	if cfg != nil && cfg.NewAccountFirstUseIntervalSec > 0 {
+		n = cfg.NewAccountFirstUseIntervalSec
+	}
+	if n < 1 {
+		n = 1
+	}
+	if n > 3600 {
+		n = 3600
+	}
+	return time.Duration(n) * time.Second
+}
+
+// UpdateNewAccountFirstUseIntervalSec sets the virgin first-use gap in seconds.
+// Clamped to 1..3600.
+func UpdateNewAccountFirstUseIntervalSec(n int) error {
+	if n < 1 {
+		n = 1
+	}
+	if n > 3600 {
+		n = 3600
+	}
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	if cfg == nil {
+		return errors.New("config not initialized")
+	}
+	cfg.NewAccountFirstUseIntervalSec = n
 	return saveSettingsLocked()
 }
 

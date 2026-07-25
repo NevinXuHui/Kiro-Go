@@ -3619,14 +3619,16 @@ func (h *Handler) apiGetStatus(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) apiGetSettings(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"apiKey":                config.GetApiKey(),
-		"requireApiKey":         config.IsApiKeyRequired(),
-		"port":                  config.GetPort(),
-		"host":                  config.GetHost(),
-		"allowOverUsage":        config.GetAllowOverUsage(),
-		"showExhaustedAccounts": config.GetShowExhaustedAccounts(),
-		"batchTestConcurrency":  config.GetBatchTestConcurrency(),
-		"importConcurrency":     config.GetImportConcurrency(),
+		"apiKey":                        config.GetApiKey(),
+		"requireApiKey":                 config.IsApiKeyRequired(),
+		"port":                          config.GetPort(),
+		"host":                          config.GetHost(),
+		"allowOverUsage":                config.GetAllowOverUsage(),
+		"showExhaustedAccounts":         config.GetShowExhaustedAccounts(),
+		"batchTestConcurrency":          config.GetBatchTestConcurrency(),
+		"importConcurrency":             config.GetImportConcurrency(),
+		"maxInFlightRequests":           config.GetMaxInFlightRequests(),
+		"newAccountFirstUseIntervalSec": int(config.GetNewAccountFirstUseInterval().Seconds()),
 	})
 }
 
@@ -3675,13 +3677,15 @@ func (h *Handler) apiUpdatePromptFilter(w http.ResponseWriter, r *http.Request) 
 
 func (h *Handler) apiUpdateSettings(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		ApiKey                *string `json:"apiKey,omitempty"`
-		RequireApiKey         *bool   `json:"requireApiKey,omitempty"`
-		Password              string  `json:"password,omitempty"`
-		AllowOverUsage        *bool   `json:"allowOverUsage,omitempty"`
-		ShowExhaustedAccounts *bool   `json:"showExhaustedAccounts,omitempty"`
-		BatchTestConcurrency  *int    `json:"batchTestConcurrency,omitempty"`
-		ImportConcurrency     *int    `json:"importConcurrency,omitempty"`
+		ApiKey                        *string `json:"apiKey,omitempty"`
+		RequireApiKey                 *bool   `json:"requireApiKey,omitempty"`
+		Password                      string  `json:"password,omitempty"`
+		AllowOverUsage                *bool   `json:"allowOverUsage,omitempty"`
+		ShowExhaustedAccounts         *bool   `json:"showExhaustedAccounts,omitempty"`
+		BatchTestConcurrency          *int    `json:"batchTestConcurrency,omitempty"`
+		ImportConcurrency             *int    `json:"importConcurrency,omitempty"`
+		MaxInFlightRequests           *int    `json:"maxInFlightRequests,omitempty"`
+		NewAccountFirstUseIntervalSec *int    `json:"newAccountFirstUseIntervalSec,omitempty"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		w.WriteHeader(400)
@@ -3727,6 +3731,24 @@ func (h *Handler) apiUpdateSettings(w http.ResponseWriter, r *http.Request) {
 	// 导入并发（独立配置）
 	if req.ImportConcurrency != nil {
 		if err := config.UpdateImportConcurrency(*req.ImportConcurrency); err != nil {
+			w.WriteHeader(500)
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+	}
+
+	// 生成请求并发上限
+	if req.MaxInFlightRequests != nil {
+		if err := config.UpdateMaxInFlightRequests(*req.MaxInFlightRequests); err != nil {
+			w.WriteHeader(500)
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+	}
+
+	// 新账号首次使用间隔（秒）
+	if req.NewAccountFirstUseIntervalSec != nil {
+		if err := config.UpdateNewAccountFirstUseIntervalSec(*req.NewAccountFirstUseIntervalSec); err != nil {
 			w.WriteHeader(500)
 			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 			return
