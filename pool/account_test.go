@@ -1,6 +1,7 @@
 package pool
 
 import (
+	"math"
 	"os"
 
 	"errors"
@@ -492,5 +493,48 @@ func TestNewAccountFirstUseAllowsOnlyVirginWhenNoExperienced(t *testing.T) {
 	again := p.GetNext()
 	if again == nil || again.ID != "only-new" {
 		t.Fatalf("expected claimed virgin reusable, got %+v", again)
+	}
+}
+
+
+func TestSelectPrefersHigherRemainingQuota(t *testing.T) {
+	p := &AccountPool{firstUseStarted: make(map[string]struct{})}
+	// Both already used so virgin gate does not apply.
+	p.accounts = []config.Account{
+		{ID: "low", AccessToken: "t", RequestCount: 3, LastUsed: 1, UsageCurrent: 90, UsageLimit: 100},
+		{ID: "high", AccessToken: "t", RequestCount: 3, LastUsed: 1, UsageCurrent: 10, UsageLimit: 100},
+	}
+	for i := 0; i < 15; i++ {
+		acc := p.GetNext()
+		if acc == nil {
+			t.Fatal("expected account")
+		}
+		if acc.ID != "high" {
+			t.Fatalf("iter %d: expected higher remaining quota account, got %q", i, acc.ID)
+		}
+	}
+}
+
+func TestSelectPrefersRemainingAmongExperiencedBeforeVirgin(t *testing.T) {
+	p := &AccountPool{firstUseStarted: make(map[string]struct{})}
+	p.accounts = []config.Account{
+		{ID: "used-low", AccessToken: "t", RequestCount: 2, LastUsed: 1, UsageCurrent: 80, UsageLimit: 100},
+		{ID: "virgin-full", AccessToken: "t", UsageCurrent: 0, UsageLimit: 100},
+	}
+	acc := p.GetNext()
+	if acc == nil || acc.ID != "used-low" {
+		t.Fatalf("expected experienced account before virgin, got %+v", acc)
+	}
+}
+
+func TestRemainingQuotaHelper(t *testing.T) {
+	if remainingQuota(config.Account{UsageLimit: 100, UsageCurrent: 40}) != 60 {
+		t.Fatalf("expected 60")
+	}
+	if remainingQuota(config.Account{UsageLimit: 0, UsageCurrent: 0}) != math.MaxFloat64 {
+		t.Fatalf("unknown limit should rank as plenty")
+	}
+	if remainingQuota(config.Account{UsageLimit: 10, UsageCurrent: 15}) != 0 {
+		t.Fatalf("over-limit remaining should be 0")
 	}
 }

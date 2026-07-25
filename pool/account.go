@@ -4,6 +4,7 @@ package pool
 
 import (
 	"kiro-go/config"
+	"math"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -128,9 +129,48 @@ func (p *AccountPool) claimVirginFirstUseLocked(acc *config.Account, now time.Ti
 	return true
 }
 
+// remainingQuota estimates how much usage headroom an account still has.
+// Higher is better. Unknown limits (UsageLimit<=0) rank as "plenty" so cold
+// accounts without refreshed quota metadata are not starved.
+func remainingQuota(acc config.Account) float64 {
+	if acc.UsageLimit <= 0 {
+		return math.MaxFloat64
+	}
+	left := acc.UsageLimit - acc.UsageCurrent
+	if left < 0 {
+		return 0
+	}
+	return left
+}
+
+// betterAccount reports whether candidate is preferable to current best under
+// "prefer more remaining quota, then higher weight" within the same pass.
+func betterAccount(candidate, best *config.Account) bool {
+	if best == nil {
+		return true
+	}
+	cr, br := remainingQuota(*candidate), remainingQuota(*best)
+	if cr != br {
+		return cr > br
+	}
+	// Tie-break: higher operator weight, then lower lifetime request count
+	// (spread load), then stable ID order.
+	cw, bw := effectiveWeight(candidate.Weight), effectiveWeight(best.Weight)
+	if cw != bw {
+		return cw > bw
+	}
+	if candidate.RequestCount != best.RequestCount {
+		return candidate.RequestCount < best.RequestCount
+	}
+	return candidate.ID < best.ID
+}
+
 // selectAccountLocked picks the next account. model=="" disables model filter.
-// Prefers already-used accounts; virgin (never-used) accounts are gated so at
-// most one new account starts its first use per configured first-use interval.
+// Rules (in order):
+//  1. Prefer already-used accounts over never-used (virgin) imports
+//  2. Among eligible peers, prefer higher remaining quota
+//  3. Virgin first-use is globally rate-limited (one new account per interval)
+//
 // Caller must hold p.mu for writing (needed to claim virgin first-use).
 func (p *AccountPool) selectAccountLocked(excluded map[string]bool, model string) *config.Account {
 	if len(p.accounts) == 0 {
@@ -140,70 +180,88 @@ func (p *AccountPool) selectAccountLocked(excluded map[string]bool, model string
 	allowOverUsage := config.GetAllowOverUsage()
 	now := time.Now()
 	n := len(p.accounts)
-	seen := make(map[string]struct{}, 8)
 
-	tryPick := func(allowVirgin bool) *config.Account {
+	// Advance RR cursor so repeated calls still rotate when many accounts share
+	// the same remaining quota (avoids sticky ID-order under ties).
+	start := int(atomic.AddUint64(&p.currentIndex, 1) % uint64(n))
+
+	pickBest := func(allowVirgin bool) *config.Account {
+		var best *config.Account
+		seen := make(map[string]struct{}, 8)
 		for i := 0; i < n; i++ {
-			idx := atomic.AddUint64(&p.currentIndex, 1) % uint64(n)
-			acc := &p.accounts[idx]
+			acc := &p.accounts[(start+i)%n]
 
 			if excluded != nil && excluded[acc.ID] {
-				seen[acc.ID] = struct{}{}
 				continue
 			}
 			if _, ok := seen[acc.ID]; ok {
 				continue
 			}
+			seen[acc.ID] = struct{}{}
+
 			if model != "" && !p.accountHasModel(acc.ID, model) {
-				seen[acc.ID] = struct{}{}
 				continue
 			}
 			if cooldown, ok := p.cooldowns[acc.ID]; ok && now.Before(cooldown) {
-				seen[acc.ID] = struct{}{}
 				continue
 			}
 			if acc.ExpiresAt > 0 && now.Unix() > acc.ExpiresAt-tokenRefreshSkewSeconds {
-				seen[acc.ID] = struct{}{}
 				continue
 			}
 			if isQuotaBlocked(*acc, allowOverUsage) {
-				seen[acc.ID] = struct{}{}
 				continue
 			}
 
 			virgin := p.isVirginAccount(acc)
 			if virgin && !allowVirgin {
-				seen[acc.ID] = struct{}{}
 				continue
 			}
-			if virgin && !p.claimVirginFirstUseLocked(acc, now) {
-				seen[acc.ID] = struct{}{}
-				continue
+			// Do not claim yet — only claim the eventual winner to avoid
+			// burning the global first-use slot on a non-selected virgin.
+			if virgin {
+				if !p.nextNewFirstUseAt.IsZero() && now.Before(p.nextNewFirstUseAt) {
+					continue
+				}
 			}
-			return accountCopy(acc)
+
+			if betterAccount(acc, best) {
+				best = acc
+			}
 		}
-		return nil
+		if best == nil {
+			return nil
+		}
+		if p.isVirginAccount(best) && !p.claimVirginFirstUseLocked(best, now) {
+			// Race with interval edge: treat as unavailable this pass.
+			return nil
+		}
+		return accountCopy(best)
 	}
 
 	// Pass 1: already-used / previously claimed accounts only.
-	clear(seen)
-	if acc := tryPick(false); acc != nil {
+	if acc := pickBest(false); acc != nil {
 		return acc
 	}
 	// Pass 2: allow one virgin first-use if the global interval permits.
-	clear(seen)
-	if acc := tryPick(true); acc != nil {
+	if acc := pickBest(true); acc != nil {
 		return acc
 	}
 
 	// Fallback: earliest-cooldown non-virgin (never force a gated virgin here).
+	// Prefer the account whose cooldown ends soonest; among equal cooldowns,
+	// still prefer higher remaining quota.
 	var best *config.Account
 	var earliest time.Time
+	seen := make(map[string]struct{}, 8)
 	for i := range p.accounts {
 		acc := &p.accounts[i]
 		if excluded != nil && excluded[acc.ID] {
 			continue
 		}
+		if _, ok := seen[acc.ID]; ok {
+			continue
+		}
+		seen[acc.ID] = struct{}{}
 		if model != "" && !p.accountHasModel(acc.ID, model) {
 			continue
 		}
@@ -213,13 +271,15 @@ func (p *AccountPool) selectAccountLocked(excluded map[string]bool, model string
 		if p.isVirginAccount(acc) {
 			continue
 		}
-		if cooldown, ok := p.cooldowns[acc.ID]; ok {
-			if best == nil || cooldown.Before(earliest) {
-				best = acc
-				earliest = cooldown
-			}
-		} else {
+		cooldown, ok := p.cooldowns[acc.ID]
+		if !ok {
+			// Should have been picked above; return immediately as available.
 			return accountCopy(acc)
+		}
+		if best == nil || cooldown.Before(earliest) ||
+			(cooldown.Equal(earliest) && betterAccount(acc, best)) {
+			best = acc
+			earliest = cooldown
 		}
 	}
 	return accountCopy(best)
