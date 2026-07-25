@@ -130,6 +130,7 @@ func (h *Handler) handleResponsesNonStream(
 ) {
 	excluded := make(map[string]bool)
 	var lastErr error
+	var lastAccountID string
 	reqStart := time.Now()
 
 	for attempt := 0; attempt < maxAccountRetryAttempts; attempt++ {
@@ -139,6 +140,7 @@ func (h *Handler) handleResponsesNonStream(
 		}
 		if err := h.ensureValidToken(account); err != nil {
 			lastErr = err
+			lastAccountID = account.ID
 			excluded[account.ID] = true
 			h.handleAccountFailure(account, err)
 			continue
@@ -169,6 +171,7 @@ func (h *Handler) handleResponsesNonStream(
 		err := CallKiroAPI(account, payload, callback)
 		if err != nil {
 			lastErr = err
+			lastAccountID = account.ID
 			excluded[account.ID] = true
 			h.handleAccountFailure(account, err)
 			continue
@@ -210,7 +213,7 @@ func (h *Handler) handleResponsesNonStream(
 		h.sendOpenAIError(w, 503, "server_error", "No available accounts")
 		return
 	}
-	h.recordFailureWithDetails("responses", model, "", lastErr)
+	h.recordFailureWithDetails("responses", model, lastAccountID, lastErr)
 	h.sendOpenAIError(w, 500, "server_error", lastErr.Error())
 }
 
@@ -314,6 +317,7 @@ func (h *Handler) handleResponsesStream(
 
 	excluded := make(map[string]bool)
 	var lastErr error
+	var lastAccountID string
 	responseStarted := false
 	reqStart := time.Now()
 
@@ -324,6 +328,7 @@ func (h *Handler) handleResponsesStream(
 		}
 		if err := h.ensureValidToken(account); err != nil {
 			lastErr = err
+			lastAccountID = account.ID
 			excluded[account.ID] = true
 			h.handleAccountFailure(account, err)
 			continue
@@ -474,6 +479,7 @@ func (h *Handler) handleResponsesStream(
 		if err != nil {
 			if !responseStarted {
 				lastErr = err
+				lastAccountID = account.ID
 				excluded[account.ID] = true
 				h.handleAccountFailure(account, err)
 				continue
@@ -572,7 +578,7 @@ func (h *Handler) handleResponsesStream(
 		})
 		return
 	}
-	h.recordFailureWithDetails("responses", model, "", lastErr)
+	h.recordFailureWithDetails("responses", model, lastAccountID, lastErr)
 	send("response.failed", map[string]interface{}{
 		"type": "response.failed",
 		"response": map[string]interface{}{

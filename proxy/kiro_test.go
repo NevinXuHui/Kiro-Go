@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"encoding/binary"
 	"encoding/json"
+	"fmt"
 	"kiro-go/config"
 	"net/http"
 	"net/url"
+	"strings"
 	"testing"
 	"time"
 )
@@ -277,5 +279,41 @@ func TestBuildKiroTransportIdlePoolSizing(t *testing.T) {
 	}
 	if tr.MaxIdleConnsPerHost != 4096 {
 		t.Fatalf("MaxIdleConnsPerHost=%d want 4096", tr.MaxIdleConnsPerHost)
+	}
+}
+
+func TestAccountDescIncludesLocalIdentity(t *testing.T) {
+	got := accountDesc(&config.Account{
+		ID:     "acc-1",
+		Email:  "user@example.com",
+		UserId: "e4980498-90b1-70de-4429-1c61bb57cdb5",
+	})
+	want := "account=user@example.com id=acc-1 userId=e4980498-90b1-70de-4429-1c61bb57cdb5"
+	if got != want {
+		t.Fatalf("accountDesc=%q want %q", got, want)
+	}
+	if accountDesc(nil) != "account=<nil>" {
+		t.Fatalf("nil accountDesc=%q", accountDesc(nil))
+	}
+}
+
+func TestWithAccountContextPrefixesUpstreamSuspension(t *testing.T) {
+	err := withAccountContext(&config.Account{
+		ID:    "acc-1",
+		Email: "user@example.com",
+	}, fmt.Errorf("HTTP 403 from Kiro IDE: {\"message\":\"Your User ID temporarily is suspended\"}"))
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "account=user@example.com id=acc-1") {
+		t.Fatalf("missing local account identity in %q", msg)
+	}
+	if !strings.Contains(msg, "temporarily is suspended") {
+		t.Fatalf("missing upstream body in %q", msg)
+	}
+	// Failover classifiers must still match after the local prefix.
+	if !isSuspensionErrorMessage(msg) {
+		t.Fatalf("suspension classifier failed for %q", msg)
 	}
 }

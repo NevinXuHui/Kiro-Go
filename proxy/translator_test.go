@@ -408,8 +408,11 @@ func TestParseModelAndThinking(t *testing.T) {
 		// Bare family name passes through (no minor to normalize).
 		{"bare sonnet 4", "claude-sonnet-4", "claude-sonnet-4", false},
 
-		// Dated snapshot must hit the alias before the regex rewrites it.
+		// Dated Anthropic snapshots strip -YYYYMMDD before mapping.
 		{"dated sonnet snapshot", "claude-sonnet-4-20250514", "claude-sonnet-4", false},
+		{"dated haiku snapshot dot form", "claude-haiku-4.5-20251001", "claude-haiku-4.5", false},
+		{"dated haiku snapshot dash form", "claude-haiku-4-5-20251001", "claude-haiku-4.5", false},
+		{"dated haiku snapshot with thinking", "claude-haiku-4.5-20251001-thinking", "claude-haiku-4.5", true},
 
 		// Cross-family legacy IDs.
 		{"claude 3.5 sonnet", "claude-3-5-sonnet", "claude-sonnet-4.5", false},

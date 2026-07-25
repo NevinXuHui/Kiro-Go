@@ -289,6 +289,43 @@ func getSortedEndpoints(preferred string) []kiroEndpoint {
 	return result
 }
 
+// accountDesc returns a stable log/error label for an account so upstream
+// failures (which often only expose Kiro User ID) can be mapped back locally.
+func accountDesc(account *config.Account) string {
+	if account == nil {
+		return "account=<nil>"
+	}
+	email := strings.TrimSpace(account.Email)
+	id := strings.TrimSpace(account.ID)
+	userID := strings.TrimSpace(account.UserId)
+	switch {
+	case email != "" && id != "" && userID != "":
+		return fmt.Sprintf("account=%s id=%s userId=%s", email, id, userID)
+	case email != "" && id != "":
+		return fmt.Sprintf("account=%s id=%s", email, id)
+	case email != "" && userID != "":
+		return fmt.Sprintf("account=%s userId=%s", email, userID)
+	case email != "":
+		return fmt.Sprintf("account=%s", email)
+	case id != "" && userID != "":
+		return fmt.Sprintf("id=%s userId=%s", id, userID)
+	case id != "":
+		return fmt.Sprintf("id=%s", id)
+	case userID != "":
+		return fmt.Sprintf("userId=%s", userID)
+	default:
+		return "account=<unknown>"
+	}
+}
+
+// withAccountContext prefixes an error with the local account label.
+func withAccountContext(account *config.Account, err error) error {
+	if err == nil {
+		return nil
+	}
+	return fmt.Errorf("%s: %w", accountDesc(account), err)
+}
+
 // CallKiroAPI calls the Kiro streaming API, trying each configured endpoint with automatic fallback.
 func CallKiroAPI(account *config.Account, payload *KiroPayload, callback *KiroStreamCallback) error {
 	originalProfileArn := ""
@@ -301,7 +338,7 @@ func CallKiroAPI(account *config.Account, payload *KiroPayload, callback *KiroSt
 	setPayloadProfileArnForAccount(payload, account)
 
 	if _, err := json.Marshal(payload); err != nil {
-		return err
+		return withAccountContext(account, err)
 	}
 
 	// Debug: dump full payload for troubleshooting upstream rejections
@@ -327,16 +364,13 @@ func CallKiroAPI(account *config.Account, payload *KiroPayload, callback *KiroSt
 		if profileArn, err := ResolveProfileArn(account); err == nil {
 			payload.ProfileArn = profileArn
 		} else {
-			accountEmail := "<nil>"
-			if account != nil {
-				accountEmail = account.Email
-			}
-			logger.Warnf("[ProfileArn] Failed to resolve profile ARN for %s: %v", accountEmail, err)
+			logger.Warnf("[ProfileArn] Failed to resolve profile ARN for %s: %v", accountDesc(account), err)
 		}
 	}
 
 	// Build endpoint list ordered by configuration.
 	endpoints := getSortedEndpoints(config.GetPreferredEndpoint())
+	acct := accountDesc(account)
 
 	var lastErr error
 	for _, ep := range endpoints {
@@ -346,7 +380,7 @@ func CallKiroAPI(account *config.Account, payload *KiroPayload, callback *KiroSt
 		reqBody, _ := json.Marshal(payload)
 		req, err := http.NewRequest("POST", ep.URL, bytes.NewReader(reqBody))
 		if err != nil {
-			lastErr = err
+			lastErr = withAccountContext(account, err)
 			continue
 		}
 
@@ -369,39 +403,45 @@ func CallKiroAPI(account *config.Account, payload *KiroPayload, callback *KiroSt
 
 		resp, err := GetClientForProxy(ResolveAccountProxyURL(account)).Do(req)
 		if err != nil {
-			lastErr = err
-			logger.Warnf("[KiroAPI] Endpoint %s failed: %v", ep.Name, err)
+			lastErr = withAccountContext(account, err)
+			logger.Warnf("[KiroAPI] %s endpoint %s failed: %v", acct, ep.Name, err)
 			continue
 		}
 
 		if resp.StatusCode == 429 {
 			resp.Body.Close()
-			logger.Warnf("[KiroAPI] Endpoint %s quota exhausted (429), trying next...", ep.Name)
-			lastErr = fmt.Errorf("quota exhausted on %s", ep.Name)
+			logger.Warnf("[KiroAPI] %s endpoint %s quota exhausted (429), trying next...", acct, ep.Name)
+			lastErr = withAccountContext(account, fmt.Errorf("quota exhausted on %s", ep.Name))
 			continue
 		}
 
 		if resp.StatusCode != 200 {
 			errBody, _ := io.ReadAll(resp.Body)
 			resp.Body.Close()
-			lastErr = fmt.Errorf("HTTP %d from %s: %s", resp.StatusCode, ep.Name, string(errBody))
+			body := strings.TrimSpace(string(errBody))
+			// Include local account identity so operators can map Kiro User ID
+			// suspensions back to an imported account/email.
+			lastErr = fmt.Errorf("%s: HTTP %d from %s: %s", acct, resp.StatusCode, ep.Name, body)
+			logger.Warnf("[KiroAPI] %s endpoint %s error status=%d body=%s", acct, ep.Name, resp.StatusCode, body)
 			// Authentication errors and payment errors are not retried across endpoints.
 			if resp.StatusCode == 401 || resp.StatusCode == 403 || resp.StatusCode == 402 {
 				return lastErr
 			}
-			logger.Warnf("[KiroAPI] Endpoint %s error: %v", ep.Name, lastErr)
 			continue
 		}
 
 		err = parseEventStream(resp.Body, callback)
 		resp.Body.Close()
-		return err
+		if err != nil {
+			return withAccountContext(account, err)
+		}
+		return nil
 	}
 
 	if lastErr != nil {
 		return lastErr
 	}
-	return fmt.Errorf("all endpoints failed")
+	return withAccountContext(account, fmt.Errorf("all endpoints failed"))
 }
 
 // ==================== Event Stream Parsing ====================

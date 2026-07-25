@@ -34,8 +34,13 @@ var modelAliases = []modelMapping{
 
 // claudeVersionPattern normalizes "claude-{family}-N-M" to "claude-{family}-N.M".
 // Minor is capped at 1-2 digits with a \b boundary so dated snapshots
-// (claude-sonnet-4-20250514) are not accidentally rewritten.
+// (claude-sonnet-4-20250514) are not accidentally rewritten as 4.20.
 var claudeVersionPattern = regexp.MustCompile(`claude-(opus|sonnet|haiku)-(\d+)-(\d{1,2})\b`)
+
+// claudeDatedSnapshotPattern strips Anthropic snapshot suffixes like -20251001
+// so clients can pass claude-haiku-4.5-20251001 while Kiro only accepts
+// claude-haiku-4.5 (INVALID_MODEL_ID otherwise).
+var claudeDatedSnapshotPattern = regexp.MustCompile(`-(20\d{6})$`)
 
 // Thinking 模式提示
 const ThinkingModePrompt = `<thinking_mode>enabled</thinking_mode>
@@ -43,6 +48,11 @@ const ThinkingModePrompt = `<thinking_mode>enabled</thinking_mode>
 
 const minimalFallbackUserContent = "."
 const toolResultsContinuationPrefix = "Tool results:"
+
+// stripClaudeDatedSnapshot removes a trailing -YYYYMMDD Anthropic snapshot tag.
+func stripClaudeDatedSnapshot(model string) string {
+	return claudeDatedSnapshotPattern.ReplaceAllString(model, "")
+}
 
 // ParseModelAndThinking resolves a client-supplied model name to a Kiro model ID
 // and reports whether thinking mode was requested via the configured suffix.
@@ -58,7 +68,17 @@ func ParseModelAndThinking(model string, thinkingSuffix string) (string, bool) {
 		lower = strings.ToLower(model)
 	}
 
-	// 1) Explicit aliases: dated snapshots, cross-family legacy IDs, non-Anthropic fallbacks.
+	// Strip Anthropic dated snapshots before alias/version mapping so both
+	// claude-haiku-4.5-20251001 and claude-sonnet-4-20250514 normalize cleanly.
+	if strings.HasPrefix(lower, "claude-") {
+		stripped := stripClaudeDatedSnapshot(lower)
+		if stripped != lower {
+			lower = stripped
+			model = stripped
+		}
+	}
+
+	// 1) Explicit aliases: remaining dated edge cases, cross-family legacy IDs, non-Anthropic fallbacks.
 	for _, m := range modelAliases {
 		if strings.Contains(lower, m.key) {
 			return m.value, thinking
@@ -73,7 +93,7 @@ func ParseModelAndThinking(model string, thinkingSuffix string) (string, bool) {
 
 	// 3) Already a valid Kiro model (dot form or bare family like claude-sonnet-4): pass through.
 	if strings.HasPrefix(lower, "claude-") {
-		return model, thinking
+		return lower, thinking
 	}
 
 	return model, thinking
