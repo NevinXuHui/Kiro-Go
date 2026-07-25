@@ -107,7 +107,7 @@ zeabur deploy
 
 部署完成后访问 `https://<你的域名>/admin` 登录管理面板。
 
-首次运行会在 `data/config.json` 自动生成配置，挂载 `/app/data` 以持久化。默认管理密码为 `changeme`，生产环境请务必通过 `ADMIN_PASSWORD` 环境变量或在管理面板中修改。
+首次运行会在 `data/kiro.db` 创建 SQLite 数据库（若存在旧版 `data/config.json` 会自动迁移并归档）。请挂载 `/app/data` 以持久化。默认管理密码为 `changeme`，生产环境请务必通过 `ADMIN_PASSWORD` 环境变量或在管理面板中修改。
 
 ## 使用方法
 
@@ -141,7 +141,8 @@ curl http://localhost:8080/v1/chat/completions \
 
 | 变量 | 说明 | 默认值 |
 |-----|------|-------|
-| `CONFIG_PATH` | 配置文件路径 | `data/config.json` |
+| `CONFIG_PATH` | 遗留配置路径（首次启动若存在则自动迁移到 SQLite） | `data/config.json` |
+| `DATABASE_PATH` | SQLite 数据库路径（主存储） | `data/kiro.db` |
 | `ADMIN_PASSWORD` | 管理面板密码（覆盖配置文件） | - |
 
 ## 参与贡献

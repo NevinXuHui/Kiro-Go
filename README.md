@@ -141,7 +141,8 @@ The setting takes effect immediately without restarting.
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `CONFIG_PATH` | Config file path | `data/config.json` |
+| `CONFIG_PATH` | Legacy config path (auto-migrated to SQLite on first boot) | `data/config.json` |
+| `DATABASE_PATH` | SQLite database path (primary store) | `data/kiro.db` |
 | `ADMIN_PASSWORD` | Admin panel password (overrides config) | - |
 
 ## Contributing
