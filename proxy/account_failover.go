@@ -255,7 +255,10 @@ func (h *Handler) handleAccountFailure(account *config.Account, err error) {
 		h.markAccountQuotaExhausted(account)
 		h.pool.MarkOverLimit(account.ID)
 	case isQuotaErrorMessage(errMsg):
+		// 429 / endpoint quota: cool the account so the pool rotates away
+		// instead of immediately re-selecting the same number.
 		h.pool.RecordError(account.ID, true)
+		logger.Infof("[AccountFailover] Cooldown %s after quota/429", account.Email)
 	case isProfileUnavailableErrorMessage(errMsg):
 		// Profile ARN may be transiently unresolvable (upstream blip, stale token).
 		// Treat as a soft failure: short cooldown so the next request rotates account,

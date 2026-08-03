@@ -318,11 +318,10 @@ func (p *AccountPool) selectAccountLocked(excluded map[string]bool, model string
 		return acc
 	}
 
-	// Fallback: earliest-cooldown non-virgin (never force a gated virgin here).
-	// Prefer the account whose cooldown ends soonest; among equal cooldowns,
-	// still prefer higher remaining quota / lower in-flight.
+	// Fallback: accounts whose cooldown has already expired (or never had one) but
+// were missed above — e.g. race with Reload. NEVER re-select an account that is
+// still inside an active cooldown window: a 429 quota cool-down must stick.
 	var best *config.Account
-	var earliest time.Time
 	seen := make(map[string]struct{}, 8)
 	for i := range p.accounts {
 		acc := &p.accounts[i]
@@ -342,22 +341,19 @@ func (p *AccountPool) selectAccountLocked(excluded map[string]bool, model string
 		if p.isVirginAccount(acc) {
 			continue
 		}
-		cooldown, ok := p.cooldowns[acc.ID]
-		if !ok {
-			// Should have been picked above; return immediately as available.
-			p.claimInFlightLocked(acc.ID)
-			return accountCopy(acc)
+		if cooldown, ok := p.cooldowns[acc.ID]; ok && now.Before(cooldown) {
+			// Still cooling (e.g. after 429) — skip until window ends.
+			continue
 		}
-		if best == nil || cooldown.Before(earliest) ||
-			(cooldown.Equal(earliest) && betterAccount(p, acc, best)) {
+		if betterAccount(p, acc, best) {
 			best = acc
-			earliest = cooldown
 		}
 	}
 	if best != nil {
 		p.claimInFlightLocked(best.ID)
+		return accountCopy(best)
 	}
-	return accountCopy(best)
+	return nil
 }
 
 // ResetSchedulingState clears first-use gates, cooldowns, in-flight and RR cursor.
@@ -473,6 +469,11 @@ func (p *AccountPool) RecordSuccess(id string) {
 	}
 }
 
+// quotaCooldownDuration is how long a 429 / quota-exhausted account stays out of
+// the selection pool. Short enough to recover from burst limits, long enough
+// to stop thrashing the same free-tier account.
+const quotaCooldownDuration = time.Hour
+
 // RecordError 记录请求错误，设置冷却
 func (p *AccountPool) RecordError(id string, isQuotaError bool) {
 	p.mu.Lock()
@@ -487,8 +488,8 @@ func (p *AccountPool) RecordError(id string, isQuotaError bool) {
 	p.errorCounts[id]++
 
 	if isQuotaError {
-		// 配额错误，冷却 1 小时
-		p.cooldowns[id] = time.Now().Add(time.Hour)
+		// 429 / quota exhausted → cool down so the pool rotates away.
+		p.cooldowns[id] = time.Now().Add(quotaCooldownDuration)
 	} else if p.errorCounts[id] >= 3 {
 		// 连续 3 次错误，冷却 1 分钟
 		p.cooldowns[id] = time.Now().Add(time.Minute)
@@ -501,6 +502,16 @@ func (p *AccountPool) RecordError(id string, isQuotaError bool) {
 			p.inFlight[id] = n - 1
 		}
 	}
+}
+
+// CooldownUntil returns when id leaves cooldown (zero if not cooling).
+func (p *AccountPool) CooldownUntil(id string) time.Time {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	if p.cooldowns == nil {
+		return time.Time{}
+	}
+	return p.cooldowns[id]
 }
 
 // IsAuthFailure reports whether an error indicates the refresh token / credentials

@@ -639,3 +639,39 @@ func TestSelectRotatesEqualRemainingSerially(t *testing.T) {
 		t.Fatalf("expected serial equal-remaining picks to rotate, got %v", seen)
 	}
 }
+
+
+// 429 cool-down must keep the account out of selection until the window ends.
+// The old fallback re-picked earliest-cooldown accounts immediately, defeating
+// RecordError(..., true).
+func TestSelectSkipsActiveQuotaCooldown(t *testing.T) {
+	p := &AccountPool{
+		accounts: []config.Account{
+			{ID: "a", Email: "a@x", Enabled: true, Weight: 1, RequestCount: 1, LastUsed: 1, UsageLimit: 50, UsageCurrent: 1},
+			{ID: "b", Email: "b@x", Enabled: true, Weight: 1, RequestCount: 1, LastUsed: 1, UsageLimit: 50, UsageCurrent: 1},
+		},
+		cooldowns:   make(map[string]time.Time),
+		errorCounts: make(map[string]int),
+		inFlight:    make(map[string]int),
+		modelLists:  make(map[string]map[string]bool),
+	}
+	p.RecordError("a", true) // 1h quota cooldown
+
+	// With only a cooling and b free, always get b.
+	for i := 0; i < 5; i++ {
+		got := p.GetNext()
+		if got == nil {
+			t.Fatalf("iter %d: expected account b, got nil", i)
+		}
+		if got.ID != "b" {
+			t.Fatalf("iter %d: got %s, want b (a is in quota cooldown)", i, got.ID)
+		}
+		p.ReleaseInFlight(got.ID)
+	}
+
+	// Cool both → nothing available (must NOT force a cooled account).
+	p.RecordError("b", true)
+	if got := p.GetNext(); got != nil {
+		t.Fatalf("expected nil when every account is cooling, got %s", got.ID)
+	}
+}
