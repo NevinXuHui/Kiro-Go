@@ -97,7 +97,11 @@ type Handler struct {
 	// per-account token refresh locks (key=accountID, value=*sync.Mutex).
 	// Avoids a single global lock serializing 4k concurrent refresh storms.
 	tokenRefreshLocks sync.Map
-	credentialImportMu sync.Mutex
+	// credentialImport gate caps concurrent imports to settings importConcurrency.
+	// A plain Mutex previously serialized ALL imports (UI concurrency became 1).
+	credentialImportMu     sync.Mutex
+	credentialImportActive int
+	credentialImportCond   *sync.Cond
 	// 请求日志 (内存环形缓冲 + SQLite 持久化)
 	requestLogs        []RequestLog
 	requestLogsMu      sync.RWMutex
@@ -365,6 +369,7 @@ func NewHandler() *Handler {
 	}()
 	// 清理过期的 stored responses（>30 天）
 	go purgeExpiredResponses(responsesDefaultTTL)
+	h.credentialImportCond = sync.NewCond(&h.credentialImportMu)
 	return h
 }
 
@@ -4212,6 +4217,56 @@ func (h *Handler) apiImportSsoToken(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+
+// acquireCredentialImportSlot limits concurrent credential imports to the
+// configured importConcurrency (default 100, max 200). Network-heavy work
+// (token refresh / profile lookup) runs under this slot so bulk import can
+// actually parallelize instead of being forced through a single global lock.
+func (h *Handler) acquireCredentialImportSlot() {
+	if h == nil {
+		return
+	}
+	if h.credentialImportCond == nil {
+		h.credentialImportMu.Lock()
+		if h.credentialImportCond == nil {
+			h.credentialImportCond = sync.NewCond(&h.credentialImportMu)
+		}
+		h.credentialImportMu.Unlock()
+	}
+	limit := config.GetImportConcurrency()
+	if limit < 1 {
+		limit = 1
+	}
+	h.credentialImportMu.Lock()
+	for h.credentialImportActive >= limit {
+		// Re-read limit while waiting so admin changes apply live.
+		limit = config.GetImportConcurrency()
+		if limit < 1 {
+			limit = 1
+		}
+		if h.credentialImportActive < limit {
+			break
+		}
+		h.credentialImportCond.Wait()
+	}
+	h.credentialImportActive++
+	h.credentialImportMu.Unlock()
+}
+
+func (h *Handler) releaseCredentialImportSlot() {
+	if h == nil {
+		return
+	}
+	h.credentialImportMu.Lock()
+	if h.credentialImportActive > 0 {
+		h.credentialImportActive--
+	}
+	if h.credentialImportCond != nil {
+		h.credentialImportCond.Signal()
+	}
+	h.credentialImportMu.Unlock()
+}
+
 func (h *Handler) apiImportCredentials(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		ID            string `json:"id"`
@@ -4230,6 +4285,8 @@ func (h *Handler) apiImportCredentials(w http.ResponseWriter, r *http.Request) {
 		TokenEndpoint string `json:"tokenEndpoint"`
 		IssuerURL     string `json:"issuerUrl"`
 		Scopes        string `json:"scopes"`
+		MachineID     string `json:"machineId"`
+		ProxyURL      string `json:"proxyURL"`
 	}
 	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -4260,8 +4317,8 @@ func (h *Handler) apiImportCredentials(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	originalRefreshToken := req.RefreshToken
-	h.credentialImportMu.Lock()
-	defer h.credentialImportMu.Unlock()
+	h.acquireCredentialImportSlot()
+	defer h.releaseCredentialImportSlot()
 	accountID := strings.TrimSpace(req.ID)
 	if accountID != "" {
 		if _, err := uuid.Parse(accountID); err != nil {
@@ -4280,6 +4337,8 @@ func (h *Handler) apiImportCredentials(w http.ResponseWriter, r *http.Request) {
 		if accountID == "" {
 			accountID = auth.GenerateAccountID()
 		}
+		// Leave MachineId empty unless the caller provided one so
+		// NormalizeAPIKeyAccount can derive the deterministic CLI machine id.
 		account := config.Account{
 			ID:         accountID,
 			Email:      strings.TrimSpace(req.Email),
@@ -4289,6 +4348,8 @@ func (h *Handler) apiImportCredentials(w http.ResponseWriter, r *http.Request) {
 			AuthMethod: "api_key",
 			Provider:   strings.TrimSpace(req.Provider),
 			Region:     strings.TrimSpace(req.Region),
+			MachineId:  strings.TrimSpace(req.MachineID),
+			ProxyURL:   strings.TrimSpace(req.ProxyURL),
 			Enabled:    true,
 		}
 		if err := config.NormalizeAPIKeyAccount(&account); err != nil {
@@ -4469,8 +4530,13 @@ func (h *Handler) apiImportCredentials(w http.ResponseWriter, r *http.Request) {
 		if tokenUserID != "" {
 			userID = tokenUserID
 		}
-	} else if tokenEmail, _, _ := auth.GetUserInfo(accessToken); tokenEmail != "" {
-		email = tokenEmail
+	} else if tokenEmail, tokenUserID, infoErr := auth.GetUserInfo(accessToken); infoErr == nil {
+		if tokenEmail != "" {
+			email = tokenEmail
+		}
+		if userID == "" && tokenUserID != "" {
+			userID = tokenUserID
+		}
 	}
 
 	if accountID == "" {
@@ -4530,6 +4596,12 @@ func (h *Handler) apiImportCredentials(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Prefer caller-provided machineId when present; otherwise generate one.
+	machineID := strings.TrimSpace(req.MachineID)
+	if machineID == "" {
+		machineID = config.GenerateMachineId()
+	}
+
 	// 创建账号
 	account := config.Account{
 		ID:                      accountID,
@@ -4546,11 +4618,12 @@ func (h *Handler) apiImportCredentials(w http.ResponseWriter, r *http.Request) {
 		Region:                  req.Region,
 		ExpiresAt:               expiresAt,
 		Enabled:                 true,
-		MachineId:               config.GenerateMachineId(),
+		MachineId:               machineID,
 		ProfileArn:              profileARN,
 		TokenEndpoint:           req.TokenEndpoint,
 		IssuerURL:               req.IssuerURL,
 		Scopes:                  req.Scopes,
+		ProxyURL:                strings.TrimSpace(req.ProxyURL),
 	}
 
 	if err := config.AddAccount(account); err != nil {
@@ -4559,11 +4632,29 @@ func (h *Handler) apiImportCredentials(w http.ResponseWriter, r *http.Request) {
 	}
 
 	h.pool.Reload()
+
+	// Resolve profileArn asynchronously — multi-region discovery is too slow to
+	// run inline under bulk import concurrency. autoRefresh / first use also fill it.
+	if account.ProfileArn == "" && !config.IsAPIKeyAccount(&account) {
+		accCopy := account
+		go func(acc config.Account) {
+			if resolved, err := ResolveProfileArn(&acc); err == nil && strings.TrimSpace(resolved) != "" {
+				if updateErr := config.UpdateAccountProfileArn(acc.ID, strings.TrimSpace(resolved)); updateErr != nil {
+					logger.Debugf("[Import] cache profileArn failed for %s: %v", acc.Email, updateErr)
+				} else {
+					h.pool.Reload()
+				}
+			}
+		}(accCopy)
+	}
+
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"success": true,
 		"account": map[string]interface{}{
-			"id":    account.ID,
-			"email": account.Email,
+			"id":         account.ID,
+			"email":      account.Email,
+			"userId":     account.UserId,
+			"profileArn": account.ProfileArn,
 		},
 	})
 }
@@ -5165,6 +5256,7 @@ func (h *Handler) apiGetAccountFull(w http.ResponseWriter, r *http.Request, id s
 		"nickname":          account.Nickname,
 		"accessToken":       account.AccessToken,
 		"refreshToken":      account.RefreshToken,
+		"kiroApiKey":        account.KiroApiKey,
 		"clientId":          account.ClientID,
 		"clientSecret":      account.ClientSecret,
 		"authMethod":        account.AuthMethod,

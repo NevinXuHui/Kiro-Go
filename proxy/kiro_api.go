@@ -371,7 +371,17 @@ func isProfileArnResolutionUnsupportedError(err error) bool {
 }
 
 func isProfileArnResolutionSoftError(err error) bool {
-	return isProfileArnResolutionSkippedError(err) || isProfileArnResolutionUnsupportedError(err)
+	if isProfileArnResolutionSkippedError(err) || isProfileArnResolutionUnsupportedError(err) {
+		return true
+	}
+	if err == nil {
+		return false
+	}
+	// Empty/unavailable profile lists should not block usage refresh or import
+	// identity hydration; generation paths already tolerate missing profileArn.
+	msg := err.Error()
+	return strings.Contains(msg, "no available Kiro profile") ||
+		strings.Contains(msg, "empty profile list")
 }
 
 func ensureRestProfileArn(account *config.Account) error {

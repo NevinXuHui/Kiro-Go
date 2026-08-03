@@ -1468,31 +1468,55 @@
       accessToken: a.accessToken || '',
       refreshToken: a.refreshToken || ''
     };
+    // Identity / routing fields — keep whenever present so re-import does not drop them.
+    if (a.id) payload.id = a.id;
+    if (a.email) payload.email = a.email;
+    if (a.nickname) payload.nickname = a.nickname;
+    if (a.userId) payload.userId = a.userId;
+    if (a.profileArn) payload.profileArn = a.profileArn;
+    if (a.kiroApiKey) payload.kiroApiKey = a.kiroApiKey;
     if (a.authMethod) payload.authMethod = a.authMethod;
     if (a.provider) payload.provider = a.provider;
+    if (a.region) payload.region = a.region;
     if (a.tokenEndpoint) payload.tokenEndpoint = a.tokenEndpoint;
     if (a.issuerUrl) payload.issuerUrl = a.issuerUrl;
     if (a.scopes) payload.scopes = a.scopes;
-    if (a.userId) payload.userId = a.userId;
-    if (a.profileArn) payload.profileArn = a.profileArn;
-    if (a.region) payload.region = a.region;
+    if (a.machineId) payload.machineId = a.machineId;
+    if (a.proxyURL) payload.proxyURL = a.proxyURL;
+    // API key accounts may only expose the key via accessToken in some payloads.
+    if (!payload.kiroApiKey && payload.authMethod === 'api_key' && payload.accessToken) {
+      payload.kiroApiKey = payload.accessToken;
+    }
     return payload;
   }
   function credentialImportPayloadFromExportAccount(a) {
     const credentials = a.credentials || {};
+    const authMethod = credentials.authMethod || a.authMethod || '';
+    const accessToken = credentials.accessToken || '';
+    // Export stores API keys in credentials.accessToken with authMethod=api_key.
+    const kiroApiKey = credentials.kiroApiKey ||
+      ((String(authMethod).toLowerCase() === 'api_key' || String(a.idp || '').toLowerCase() === 'apikey')
+        ? accessToken
+        : '');
     return credentialImportPayloadFromFullAccount({
+      id: a.id,
+      email: a.email,
+      nickname: a.nickname,
+      userId: a.userId,
+      profileArn: a.profileArn,
+      machineId: a.machineId,
       clientId: credentials.clientId,
       clientSecret: credentials.clientSecret,
-      accessToken: credentials.accessToken,
+      accessToken,
       refreshToken: credentials.refreshToken,
-      authMethod: credentials.authMethod || a.authMethod,
+      kiroApiKey,
+      authMethod,
       provider: credentials.provider || a.provider || a.idp,
       tokenEndpoint: credentials.tokenEndpoint,
       issuerUrl: credentials.issuerUrl,
       scopes: credentials.scopes,
-      userId: a.userId,
-      profileArn: a.profileArn,
-      region: credentials.region || a.region
+      region: credentials.region || a.region,
+      proxyURL: a.proxyURL || credentials.proxyURL
     });
   }
   async function copyAccountJSON(id, btn) {
@@ -3379,7 +3403,9 @@
           kiroApiKey: kiroApiKey || item.accessToken || '',
           authMethod: 'api_key',
           provider: rawProvider || 'APIKey',
-          region: item.region || 'us-east-1'
+          region: item.region || 'us-east-1',
+          machineId: item.machineId || '',
+          proxyURL: item.proxyURL || ''
         };
         try {
           const res = await api('/auth/credentials', { method: 'POST', body: JSON.stringify(payload) });
@@ -3439,7 +3465,9 @@
         region: item.region || (isExternalIdp ? '' : 'us-east-1'),
         tokenEndpoint: item.tokenEndpoint || '',
         issuerUrl: item.issuerUrl || '',
-        scopes: item.scopes || ''
+        scopes: item.scopes || '',
+        machineId: item.machineId || '',
+        proxyURL: item.proxyURL || ''
       };
 
       try {
@@ -3518,7 +3546,9 @@
       region: value('region'),
       tokenEndpoint: value('tokenEndpoint'),
       issuerUrl: value('issuerUrl'),
-      scopes: value('scopes')
+      scopes: value('scopes'),
+      machineId: value('machineId'),
+      proxyURL: value('proxyURL')
     };
   }
   function parseLineCredentials(text) {
