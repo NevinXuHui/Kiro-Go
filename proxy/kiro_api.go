@@ -20,8 +20,11 @@ import (
 const (
 	kiroRestAPIBase               = "https://codewhisperer.us-east-1.amazonaws.com"
 	profileArnUnsupportedCooldown = 24 * time.Hour
-	maxProfileResponseBytes       = 1 << 20
-	maxProfileErrorBytes          = 64 << 10
+	// Empty/unavailable profile lookups used to re-run on every request.
+	// Cache the negative result so REST/background paths do not thrash.
+	profileArnEmptyCooldown    = 30 * time.Minute
+	maxProfileResponseBytes = 1 << 20
+	maxProfileErrorBytes    = 64 << 10
 )
 
 var profileArnResolutionCooldowns sync.Map
@@ -266,6 +269,10 @@ func ResolveProfileArn(account *config.Account) (string, error) {
 		return profileArn, nil
 	}
 
+	if isProfileArnEmptyCached(account) {
+		return "", fmt.Errorf("no available Kiro profile")
+	}
+
 	profileLookupSuppressed := isProfileArnResolutionSuppressed(account)
 	var profileUnsupportedErr error
 	var profileUnsupported bool
@@ -309,6 +316,7 @@ func ResolveProfileArn(account *config.Account) (string, error) {
 		return "", fmt.Errorf("profile ARN unsupported for Builder ID account")
 	}
 
+	cacheProfileArnEmpty(account)
 	return "", fmt.Errorf("no available Kiro profile")
 }
 
@@ -343,6 +351,39 @@ func suppressProfileArnResolution(account *config.Account) {
 		return
 	}
 	profileArnResolutionCooldowns.Store(key, time.Now().Add(profileArnUnsupportedCooldown))
+}
+
+func cacheProfileArnEmpty(account *config.Account) {
+	key := profileArnEmptyCacheKey(account)
+	if key == "" {
+		return
+	}
+	profileArnResolutionCooldowns.Store(key, time.Now().Add(profileArnEmptyCooldown))
+}
+
+func isProfileArnEmptyCached(account *config.Account) bool {
+	key := profileArnEmptyCacheKey(account)
+	if key == "" {
+		return false
+	}
+	value, ok := profileArnResolutionCooldowns.Load(key)
+	if !ok {
+		return false
+	}
+	until, ok := value.(time.Time)
+	if !ok || time.Now().After(until) {
+		profileArnResolutionCooldowns.Delete(key)
+		return false
+	}
+	return true
+}
+
+func profileArnEmptyCacheKey(account *config.Account) string {
+	base := profileArnCooldownKey(account)
+	if base == "" {
+		return ""
+	}
+	return "empty\x00" + base
 }
 
 func isProfileArnResolutionSuppressed(account *config.Account) bool {

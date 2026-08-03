@@ -168,9 +168,17 @@ func (p *AccountPool) inFlightCount(id string) int {
 	return p.inFlight[id]
 }
 
+// tokenIsFresh reports whether acc can serve traffic without a blocking refresh.
+func tokenIsFresh(acc *config.Account, now time.Time) bool {
+	if acc == nil || acc.ExpiresAt <= 0 {
+		return true
+	}
+	return now.Unix() < acc.ExpiresAt-tokenRefreshSkewSeconds
+}
+
 // betterAccount reports whether candidate is preferable to current best under:
-// under per-account in-flight soft cap → higher remaining quota → lower
-// in-flight → higher weight → experienced over virgin.
+// under per-account in-flight soft cap → fresh token → higher remaining quota
+// → lower in-flight → higher weight → experienced over virgin.
 //
 // Soft cap: once an account already has defaultMaxAccountInFlight concurrent
 // attempts, any peer still under the cap wins — even with lower remaining
@@ -190,6 +198,11 @@ func betterAccount(p *AccountPool, candidate, best *config.Account) bool {
 			// Prefer the account still under the soft cap.
 			return !cOver && bOver
 		}
+	}
+	now := time.Now()
+	cFresh, bFresh := tokenIsFresh(candidate, now), tokenIsFresh(best, now)
+	if cFresh != bFresh {
+		return cFresh && !bFresh
 	}
 	cr, br := remainingQuota(*candidate), remainingQuota(*best)
 	if cr != br {
@@ -298,9 +311,11 @@ func (p *AccountPool) selectAccountLocked(excluded map[string]bool, model string
 			if cooldown, ok := p.cooldowns[acc.ID]; ok && now.Before(cooldown) {
 				continue
 			}
-			if acc.ExpiresAt > 0 && now.Unix() > acc.ExpiresAt-tokenRefreshSkewSeconds {
-				continue
-			}
+			// Do NOT hard-skip near-expired tokens here. With large import pools a
+			// majority can sit inside the refresh skew window; skipping them
+			// concentrates all traffic onto a handful of still-valid numbers and
+			// destroys both concurrency headroom and TTFT (retry storms). Prefer
+			// fresh tokens via betterAccount; ensureValidToken refreshes on pick.
 			if isQuotaBlocked(*acc, allowOverUsage) {
 				continue
 			}
@@ -520,17 +535,20 @@ func (p *AccountPool) RecordSuccess(id string) {
 	}
 }
 
-// quotaCooldownDuration is how long a 429 / quota-exhausted account stays out of
-// the selection pool. Short enough to recover from burst limits, long enough
-// to stop thrashing the same free-tier account.
-const quotaCooldownDuration = time.Hour
+// Cooldown windows for upstream pressure. Free-tier 429s are usually short
+// burst/rate limits; a full hour parked too many healthy numbers after a spike.
+const (
+	// rateLimitCooldownDuration: bare HTTP 429 / throttling.
+	rateLimitCooldownDuration = 5 * time.Minute
+	// quotaCooldownDuration: explicit quota-exhausted wording (still temporary).
+	quotaCooldownDuration = 20 * time.Minute
+)
 
-// BeginQuotaCooldown marks id cooling immediately without releasing in-flight.
-// Used on the first upstream 429 so concurrent selectors stop pile-ons while
-// the same request still finishes endpoint fallback / handleAccountFailure.
-// Idempotent: refreshes the cooldown window each call.
-func (p *AccountPool) BeginQuotaCooldown(id string) {
-	if id == "" {
+// BeginCooldown marks id cooling for d without releasing in-flight.
+// Used on the first upstream 429 so concurrent selectors stop pile-ons.
+// Idempotent per call; a longer window wins if one is already active.
+func (p *AccountPool) BeginCooldown(id string, d time.Duration) {
+	if id == "" || d <= 0 {
 		return
 	}
 	p.mu.Lock()
@@ -538,11 +556,36 @@ func (p *AccountPool) BeginQuotaCooldown(id string) {
 	if p.cooldowns == nil {
 		p.cooldowns = make(map[string]time.Time)
 	}
-	p.cooldowns[id] = time.Now().Add(quotaCooldownDuration)
+	until := time.Now().Add(d)
+	if prev, ok := p.cooldowns[id]; ok && prev.After(until) {
+		return
+	}
+	p.cooldowns[id] = until
 }
 
-// RecordError 记录请求错误，设置冷却
+// BeginQuotaCooldown is a compatibility wrapper for the longer quota window.
+func (p *AccountPool) BeginQuotaCooldown(id string) {
+	p.BeginCooldown(id, quotaCooldownDuration)
+}
+
+// BeginRateLimitCooldown applies the short 429/throttle window.
+func (p *AccountPool) BeginRateLimitCooldown(id string) {
+	p.BeginCooldown(id, rateLimitCooldownDuration)
+}
+
+// RecordError 记录请求错误，设置冷却。
+// isQuotaError=true uses quotaCooldownDuration; callers that only saw a bare
+// rate-limit 429 should prefer RecordRateLimit.
 func (p *AccountPool) RecordError(id string, isQuotaError bool) {
+	p.recordErrorWithCooldown(id, isQuotaError, quotaCooldownDuration)
+}
+
+// RecordRateLimit cools a bare 429/throttle without the longer quota window.
+func (p *AccountPool) RecordRateLimit(id string) {
+	p.recordErrorWithCooldown(id, true, rateLimitCooldownDuration)
+}
+
+func (p *AccountPool) recordErrorWithCooldown(id string, setCooldown bool, d time.Duration) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
@@ -554,9 +597,11 @@ func (p *AccountPool) RecordError(id string, isQuotaError bool) {
 	}
 	p.errorCounts[id]++
 
-	if isQuotaError {
-		// 429 / quota exhausted → cool down so the pool rotates away.
-		p.cooldowns[id] = time.Now().Add(quotaCooldownDuration)
+	if setCooldown {
+		until := time.Now().Add(d)
+		if prev, ok := p.cooldowns[id]; !ok || until.After(prev) {
+			p.cooldowns[id] = until
+		}
 	} else if p.errorCounts[id] >= 3 {
 		// 连续 3 次错误，冷却 1 分钟
 		p.cooldowns[id] = time.Now().Add(time.Minute)

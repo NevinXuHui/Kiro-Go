@@ -655,7 +655,7 @@ func TestSelectSkipsActiveQuotaCooldown(t *testing.T) {
 		inFlight:    make(map[string]int),
 		modelLists:  make(map[string]map[string]bool),
 	}
-	p.RecordError("a", true) // 1h quota cooldown
+	p.RecordError("a", true) // quota cooldown window
 
 	// With only a cooling and b free, always get b.
 	for i := 0; i < 5; i++ {

@@ -146,6 +146,15 @@ func buildKiroTransport(proxyURL string) *http.Transport {
 		MaxConnsPerHost:     0,
 		IdleConnTimeout:     120 * time.Second,
 		DisableCompression:  false,
+		// Fail slow dials / hung headers fast so account failover can rotate
+		// instead of sitting on a black-holed connection until the 5m client timeout.
+		DialContext: (&net.Dialer{
+			Timeout:   5 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+		TLSHandshakeTimeout:   5 * time.Second,
+		ResponseHeaderTimeout: 60 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
 		// AWS Event Stream is more reliable over HTTP/1.1. HTTP/2 has been
 		// observed to end mid-response with a clean EOF, which then surfaces as
 		// "upstream truncated response without stop reason".
@@ -431,15 +440,12 @@ func CallKiroAPIContext(ctx context.Context, account *config.Account, payload *K
 		callback = &wrapped
 	}
 
-	if payload != nil && strings.TrimSpace(payload.ProfileArn) == "" && !config.IsAPIKeyAccount(account) {
-		if profileArn, err := ResolveProfileArn(account); err == nil {
-			payload.ProfileArn = profileArn
-		} else if isProfileArnResolutionSoftError(err) {
-			logger.Debugf("[ProfileArn] Skipped profile ARN resolution for %s: %v", accountEmailForLog(account), err)
-		} else {
-			logger.Warnf("[ProfileArn] Failed to resolve profile ARN for %s: %v", accountEmailForLog(account), err)
-		}
-	}
+	// HOT PATH: never call ResolveProfileArn here. Multi-region
+	// ListAvailableProfiles (+ optional token refresh) routinely costs seconds
+	// before the first upstream byte. setPayloadProfileArnForAccount already
+	// copies a cached account.ProfileArn; generation tolerates a missing ARN
+	// (BuilderId IdC streams work without it). Import/background refresh fill
+	// ProfileArn asynchronously when available.
 
 	// Build endpoint list ordered by configuration / credential type.
 	endpoints := resolveKiroEndpoints(account)
@@ -514,17 +520,18 @@ endpointLoop:
 
 			if resp.StatusCode == 429 {
 				resp.Body.Close()
-				logger.Warnf("[KiroAPI] Endpoint %s quota exhausted (429), trying next...", ep.Name)
+				logger.Warnf("[KiroAPI] Endpoint %s rate limited (429), failing account fast...", ep.Name)
 				quotaExhaustedEndpoints = append(quotaExhaustedEndpoints, ep.Name)
 				// Cool immediately on the first 429 so concurrent selectors stop
-				// pile-ons while this request still walks remaining endpoints.
-				// BeginQuotaCooldown does not touch in-flight; handleAccountFailure
-				// still RecordError later to release the select claim.
+				// pile-ons. Short rate-limit window — free-tier bursts recover
+				// in minutes. handleAccountFailure still releases in-flight.
 				if account != nil && account.ID != "" {
-					accountpool.GetPool().BeginQuotaCooldown(account.ID)
+					accountpool.GetPool().BeginRateLimitCooldown(account.ID)
 				}
-				lastErr = withAccountContext(account, fmt.Errorf("quota exhausted on %s", ep.Name))
-				continue endpointLoop
+				lastErr = withAccountContext(account, fmt.Errorf("rate limited (HTTP 429) on %s", ep.Name))
+				// Free-tier 429 almost always hits every endpoint; burning the
+				// full fallback chain only delays account rotation and TTFT.
+				return lastErr
 			}
 
 			if resp.StatusCode != 200 {

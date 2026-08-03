@@ -12,6 +12,7 @@ import (
 	"kiro-go/pool"
 	"net/http"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -434,95 +435,294 @@ func (h *Handler) Close() error {
 	return nil
 }
 
-// backgroundRefresh 后台定时刷新账户信息
+// backgroundRefresh runs two cadences:
+//   1) frequent token refresh for near-expiry credentials (keeps selection pool wide)
+//   2) slower metadata backfill (usage + profileArn) so remaining-quota scheduling works
+// Full-fleet GetUsageLimits every 30m previously stampeded 6k accounts and logged each
+// success at Info — that both starved the hot path and hid real errors.
 func (h *Handler) backgroundRefresh() {
-	ticker := time.NewTicker(30 * time.Minute) // 每 30 分钟刷新一次
-	defer ticker.Stop()
+	tokenTicker := time.NewTicker(2 * time.Minute)
+	metaTicker := time.NewTicker(10 * time.Minute)
+	modelTicker := time.NewTicker(30 * time.Minute)
+	defer tokenTicker.Stop()
+	defer metaTicker.Stop()
+	defer modelTicker.Stop()
 
-	// 启动时延迟 10 秒后执行一次；可被 stop 打断，避免 Close 卡 10s
+	// Startup: token pass first (cheap), then several metadata waves so a cold
+	// 6k-account import hydrates usageLimit quickly for remaining-quota routing.
 	select {
-	case <-time.After(10 * time.Second):
-		h.refreshModelsCache()
-		h.refreshAllAccounts()
+	case <-time.After(3 * time.Second):
+		h.refreshExpiringTokens()
+		for wave := 0; wave < backgroundMetaStartupWaves; wave++ {
+			select {
+			case <-h.stopRefresh:
+				return
+			default:
+			}
+			h.backfillAccountMetadata(backgroundMetaBatchSize)
+		}
 	case <-h.stopRefresh:
 		return
 	}
 
 	for {
 		select {
-		case <-ticker.C:
+		case <-tokenTicker.C:
+			h.refreshExpiringTokens()
+		case <-metaTicker.C:
+			h.backfillAccountMetadata(backgroundMetaBatchSize)
+		case <-modelTicker.C:
 			h.refreshModelsCache()
-			h.refreshAllAccounts()
 		case <-h.stopRefresh:
 			return
 		}
 	}
 }
 
-// backgroundRefreshWorkers caps concurrent account refreshes so 4k+ accounts
-// do not stampede upstream or the SQLite writer.
-const backgroundRefreshWorkers = 32
+const (
+	// backgroundTokenRefreshWorkers is sized for large import fleets: 6k accounts
+	// with ~1h tokens need steady refresh without blocking generation.
+	backgroundTokenRefreshWorkers = 64
+	// backgroundMetaWorkers caps usage/profile probes (heavier than token refresh).
+	backgroundMetaWorkers = 24
+	// backgroundMetaBatchSize limits one metadata wave so a cold start does not
+	// hammer upstream for tens of minutes before the next token pass.
+	backgroundMetaBatchSize = 800
+	// backgroundMetaStartupWaves is how many batches to run right after boot.
+	backgroundMetaStartupWaves = 6
+	// refresh tokens this far before ExpiresAt (wider than the select skew so the
+	// hot path rarely blocks on ensureValidToken).
+	backgroundTokenRefreshSkewSeconds int64 = 600
+)
 
-// refreshAllAccounts 并发刷新账户信息（worker pool）。
-func (h *Handler) refreshAllAccounts() {
+// refreshExpiringTokens refreshes OAuth access tokens that are inside the
+// background skew window. Does not call GetUsageLimits.
+func (h *Handler) refreshExpiringTokens() {
 	accounts := config.GetAccounts()
-	jobs := make(chan int, len(accounts))
-	var wg sync.WaitGroup
+	if len(accounts) == 0 {
+		return
+	}
+	now := time.Now().Unix()
+	type job struct {
+		idx int
+	}
+	jobs := make(chan job, 256)
+	var (
+		wg      sync.WaitGroup
+		refreshed atomic.Int64
+		failed    atomic.Int64
+	)
 
 	worker := func() {
 		defer wg.Done()
-		for i := range jobs {
-			account := &accounts[i]
-			if !account.Enabled || accountBearerToken(account) == "" {
+		for j := range jobs {
+			acc := accounts[j.idx]
+			if !acc.Enabled || config.IsAPIKeyAccount(&acc) {
 				continue
 			}
-
-			// API Key accounts skip OAuth refresh; still sync usage/subscription.
-			if !config.IsAPIKeyAccount(account) {
-				// Skip banned accounts — they cannot serve traffic until re-auth.
-				if account.BanStatus == "BANNED" || account.BanStatus == "DISABLED" {
-					continue
-				}
-
-				// 检查 token 是否需要刷新
-				if account.ExpiresAt > 0 && time.Now().Unix() > account.ExpiresAt-tokenRefreshSkewSeconds {
-					if _, err := h.refreshAccountToken(account, false); err != nil {
-						logger.Warnf("[BackgroundRefresh] Token refresh failed for %s: %v", account.Email, err)
-						h.handleAccountFailure(account, err)
-						continue
-					}
-				}
-
-				// 刷新账户信息
-				info, err := RefreshAccountInfo(account)
-				if err != nil {
-					logger.Warnf("[BackgroundRefresh] Failed to refresh %s: %v", account.Email, err)
-					continue
-				}
-
-				config.UpdateAccountInfo(account.ID, *info)
-				logger.Infof("[BackgroundRefresh] Refreshed %s: %s %.1f/%.1f", account.Email, info.SubscriptionType, info.UsageCurrent, info.UsageLimit)
+			if acc.BanStatus == "BANNED" || acc.BanStatus == "DISABLED" {
+				continue
 			}
+			if strings.TrimSpace(acc.RefreshToken) == "" {
+				continue
+			}
+			// Only touch tokens that need refresh soon / already expired.
+			if acc.ExpiresAt > 0 && now < acc.ExpiresAt-backgroundTokenRefreshSkewSeconds {
+				continue
+			}
+			working := acc
+			if _, err := h.refreshAccountToken(&working, false); err != nil {
+				failed.Add(1)
+				logger.Warnf("[BackgroundRefresh] Token refresh failed for %s: %v", acc.Email, err)
+				h.handleAccountFailure(&working, err)
+				continue
+			}
+			refreshed.Add(1)
 		}
 	}
 
-	workers := backgroundRefreshWorkers
-	if workers > len(accounts) && len(accounts) > 0 {
+	workers := backgroundTokenRefreshWorkers
+	if workers > len(accounts) {
 		workers = len(accounts)
 	}
 	if workers < 1 {
 		workers = 1
 	}
 	wg.Add(workers)
-	for w := 0; w < workers; w++ {
+	for i := 0; i < workers; i++ {
 		go worker()
 	}
+	// Prioritize soonest-expiring first so the hottest credentials stay fresh.
+	order := make([]int, 0, len(accounts))
 	for i := range accounts {
-		jobs <- i
+		order = append(order, i)
+	}
+	// simple insertion-free sort via slice stable by ExpiresAt (0 = unknown last)
+	sort.SliceStable(order, func(i, j int) bool {
+		ai, aj := accounts[order[i]].ExpiresAt, accounts[order[j]].ExpiresAt
+		if ai == 0 && aj == 0 {
+			return false
+		}
+		if ai == 0 {
+			return false
+		}
+		if aj == 0 {
+			return true
+		}
+		return ai < aj
+	})
+	for _, i := range order {
+		jobs <- job{idx: i}
+	}
+	close(jobs)
+	wg.Wait()
+	if n := refreshed.Load(); n > 0 || failed.Load() > 0 {
+		logger.Infof("[BackgroundRefresh] token pass refreshed=%d failed=%d pool=%d", n, failed.Load(), len(accounts))
+	}
+}
+
+// backfillAccountMetadata fills missing usage limits and profileArn for a
+// bounded batch of enabled accounts. Prioritizes accounts that lack usage
+// metadata (remaining-quota scheduling) and profileArn.
+func (h *Handler) backfillAccountMetadata(limit int) {
+	if limit < 1 {
+		limit = backgroundMetaBatchSize
+	}
+	accounts := config.GetAccounts()
+	if len(accounts) == 0 {
+		return
+	}
+
+	type scored struct {
+		idx   int
+		score int
+	}
+	candidates := make([]scored, 0, len(accounts))
+	for i := range accounts {
+		acc := &accounts[i]
+		if !acc.Enabled || accountBearerToken(acc) == "" {
+			continue
+		}
+		if acc.BanStatus == "BANNED" || acc.BanStatus == "DISABLED" {
+			continue
+		}
+		score := 0
+		if acc.UsageLimit <= 0 {
+			score += 2
+		}
+		if !config.IsAPIKeyAccount(acc) && strings.TrimSpace(acc.ProfileArn) == "" {
+			score += 1
+		}
+		if score == 0 {
+			// Still periodically refresh usage for already-hydrated accounts, but
+			// deprioritize them so cold imports fill first.
+			score = -1
+		}
+		candidates = append(candidates, scored{idx: i, score: score})
+	}
+	sort.SliceStable(candidates, func(i, j int) bool {
+		return candidates[i].score > candidates[j].score
+	})
+	if len(candidates) > limit {
+		candidates = candidates[:limit]
+	}
+	if len(candidates) == 0 {
+		return
+	}
+
+	jobs := make(chan int, len(candidates))
+	var (
+		wg       sync.WaitGroup
+		usageOK  atomic.Int64
+		profOK   atomic.Int64
+		failed   atomic.Int64
+	)
+	worker := func() {
+		defer wg.Done()
+		for idx := range jobs {
+			acc := accounts[idx]
+			working := acc
+
+			// Ensure token is usable before metadata probes.
+			if !config.IsAPIKeyAccount(&working) {
+				if working.ExpiresAt > 0 && time.Now().Unix() > working.ExpiresAt-tokenRefreshSkewSeconds {
+					if _, err := h.refreshAccountToken(&working, false); err != nil {
+						failed.Add(1)
+						logger.Warnf("[BackgroundRefresh] pre-meta token refresh failed for %s: %v", working.Email, err)
+						h.handleAccountFailure(&working, err)
+						continue
+					}
+				}
+			}
+
+			// profileArn backfill (generation no longer blocks on this).
+			if !config.IsAPIKeyAccount(&working) && strings.TrimSpace(working.ProfileArn) == "" {
+				if arn, err := ResolveProfileArn(&working); err == nil && strings.TrimSpace(arn) != "" {
+					if updateErr := config.UpdateAccountProfileArn(working.ID, strings.TrimSpace(arn)); updateErr != nil {
+						logger.Debugf("[BackgroundRefresh] cache profileArn failed for %s: %v", working.Email, updateErr)
+					} else {
+						working.ProfileArn = strings.TrimSpace(arn)
+						profOK.Add(1)
+					}
+				}
+			}
+
+			info, err := RefreshAccountInfo(&working)
+			if err != nil {
+				failed.Add(1)
+				logger.Debugf("[BackgroundRefresh] usage refresh failed for %s: %v", working.Email, err)
+				continue
+			}
+			if err := config.UpdateAccountInfo(working.ID, *info); err != nil {
+				failed.Add(1)
+				logger.Debugf("[BackgroundRefresh] persist usage failed for %s: %v", working.Email, err)
+				continue
+			}
+			usageOK.Add(1)
+		}
+	}
+
+	workers := backgroundMetaWorkers
+	if workers > len(candidates) {
+		workers = len(candidates)
+	}
+	if workers < 1 {
+		workers = 1
+	}
+	wg.Add(workers)
+	for i := 0; i < workers; i++ {
+		go worker()
+	}
+	for _, c := range candidates {
+		jobs <- c.idx
 	}
 	close(jobs)
 	wg.Wait()
 	h.pool.Reload()
+	logger.Infof("[BackgroundRefresh] meta pass usage=%d profile=%d failed=%d batch=%d",
+		usageOK.Load(), profOK.Load(), failed.Load(), len(candidates))
+}
+
+// refreshAllAccounts keeps the old entry point for admin/tests: token pass + one
+// metadata wave over the whole enabled set (chunked).
+func (h *Handler) refreshAllAccounts() {
+	h.refreshExpiringTokens()
+	// Multiple waves so a manual "refresh all" still converges on large fleets.
+	for i := 0; i < 8; i++ {
+		before := time.Now()
+		h.backfillAccountMetadata(backgroundMetaBatchSize)
+		// Stop early when a wave finishes almost instantly (nothing left to fill)
+		// or stop channel closed.
+		select {
+		case <-h.stopRefresh:
+			return
+		default:
+		}
+		if time.Since(before) < 500*time.Millisecond {
+			break
+		}
+	}
+	h.refreshModelsCache()
 }
 
 // validateApiKey 验证 API Key（Bool 包装，旧签名仍被部分调用方使用）
@@ -1110,6 +1310,9 @@ func (h *Handler) handleClaudeStream(ctx context.Context, w http.ResponseWriter,
 	var lastErr error
 	var lastAccountID string
 	messageStarted := false
+	// contentStarted tracks whether any assistant content reached the client.
+	// message_start alone must NOT disable same-account integrity retries.
+	contentStarted := false
 	var messageStartUsage promptCacheUsage
 
 	ensureMessageStart := func() {
@@ -1131,6 +1334,11 @@ func (h *Handler) handleClaudeStream(ctx context.Context, w http.ResponseWriter,
 		})
 		messageStarted = true
 	}
+
+	// Emit message_start immediately so clients see first-byte progress while we
+	// still select/refresh an account and wait on upstream headers. Usage fields
+	// stay provisional until the real prompt-cache computation runs.
+	ensureMessageStart()
 
 	for attempt := 0; attempt < maxAccountRetryAttempts; attempt++ {
 		account := h.pool.GetNextForModelExcluding(model, excluded)
@@ -1175,6 +1383,7 @@ func (h *Handler) handleClaudeStream(ctx context.Context, w http.ResponseWriter,
 				return
 			}
 			ensureMessageStart()
+			contentStarted = true
 			closeActiveBlock()
 
 			idx := nextContentIndex
@@ -1331,12 +1540,9 @@ func (h *Handler) handleClaudeStream(ctx context.Context, w http.ResponseWriter,
 						inThinkingBlock = true
 						dropTagThinking = !allowTagSource(&thinkingSource)
 						thinkingStarted = false
-					} else if forceFlush || len([]rune(textBuffer)) > 50 {
+					} else if forceFlush || shouldFlushStreamText(textBuffer) {
 						runes := []rune(textBuffer)
-						safeLen := len(runes)
-						if !forceFlush {
-							safeLen = max(0, len(runes)-15)
-						}
+						safeLen := streamTextSafeLen(runes, textBuffer, forceFlush)
 						if safeLen > 0 {
 							sendText(string(runes[:safeLen]), 0)
 							textBuffer = string(runes[safeLen:])
@@ -1494,7 +1700,7 @@ func (h *Handler) handleClaudeStream(ctx context.Context, w http.ResponseWriter,
 		}
 
 		err := runKiroWithIntegrityRetry(ctx, account, payload, callback, measure, reset,
-			func() bool { return !messageStarted })
+			func() bool { return !contentStarted })
 		if err != nil {
 			if ctx.Err() != nil {
 				return
@@ -1567,6 +1773,39 @@ func (h *Handler) handleClaudeStream(ctx context.Context, w http.ResponseWriter,
 
 	h.recordFailureWithDetails("claude", model, lastAccountID, lastErr)
 	h.sendClaudeError(w, 500, "api_error", lastErr.Error())
+}
+
+
+// shouldFlushStreamText decides when buffered assistant text is safe to emit.
+// Flush immediately when no raw "<" is present (no partial <thinking> tag risk)
+// so first-token latency is not held back by the historical 50-rune threshold.
+func shouldFlushStreamText(buf string) bool {
+	if buf == "" {
+		return false
+	}
+	n := len([]rune(buf))
+	if !strings.Contains(buf, "<") {
+		// Flush early for TTFT, but keep a tiny buffer so same-account
+		// integrity retries can still recover unflushed micro-chunks.
+		return n >= 8
+	}
+	return n > 50
+}
+
+// streamTextSafeLen returns how many runes of buf can be emitted now.
+// When a raw "<" is present, keep a short tail so a split "<thinking>" tag is
+// not flushed mid-token; otherwise emit the full buffer for minimal TTFT.
+func streamTextSafeLen(runes []rune, buf string, forceFlush bool) int {
+	if len(runes) == 0 {
+		return 0
+	}
+	if forceFlush || !strings.Contains(buf, "<") {
+		return len(runes)
+	}
+	if len(runes) <= 15 {
+		return 0
+	}
+	return len(runes) - 15
 }
 
 func (h *Handler) sendSSE(w http.ResponseWriter, flusher http.Flusher, event string, data interface{}) {
@@ -2273,6 +2512,25 @@ func (h *Handler) handleOpenAIStream(ctx context.Context, w http.ResponseWriter,
 	var lastAccountID string
 	reqStart := time.Now()
 
+	// Early role chunk: clients see first SSE bytes while we still select/refresh
+	// an account. Does NOT set responseStarted — integrity retries stay allowed
+	// until real content is flushed.
+	{
+		early, _ := json.Marshal(map[string]interface{}{
+			"id":      chatID,
+			"object":  "chat.completion.chunk",
+			"created": time.Now().Unix(),
+			"model":   model,
+			"choices": []map[string]interface{}{{
+				"index": 0,
+				"delta": map[string]string{"role": "assistant"},
+				"finish_reason": nil,
+			}},
+		})
+		fmt.Fprintf(w, "data: %s\n\n", early)
+		flusher.Flush()
+	}
+
 	for attempt := 0; attempt < maxAccountRetryAttempts; attempt++ {
 		account := h.pool.GetNextForModelExcluding(model, excluded)
 		if account == nil {
@@ -2449,12 +2707,9 @@ func (h *Handler) handleOpenAIStream(ctx context.Context, w http.ResponseWriter,
 						inThinkingBlock = true
 						dropTagThinking = !allowTagSource(&thinkingSource)
 						thinkingStarted = false
-					} else if forceFlush || len([]rune(textBuffer)) > 50 {
+					} else if forceFlush || shouldFlushStreamText(textBuffer) {
 						runes := []rune(textBuffer)
-						safeLen := len(runes)
-						if !forceFlush {
-							safeLen = max(0, len(runes)-15)
-						}
+						safeLen := streamTextSafeLen(runes, textBuffer, forceFlush)
 						if safeLen > 0 {
 							sendChunk(string(runes[:safeLen]), 0)
 							textBuffer = string(runes[safeLen:])

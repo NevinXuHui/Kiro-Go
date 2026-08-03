@@ -115,6 +115,28 @@ func isQuotaErrorMessage(msg string) bool {
 	return hasHTTPStatusToken(msg, "429") || hasHTTPStatusToken(lower, "429")
 }
 
+// isRateLimitErrorMessage detects transient throttling (HTTP 429 / "too many
+// requests") that is NOT monthly/hard quota exhaustion. These should use a
+// short cooldown so free-tier numbers re-enter the pool quickly after a burst.
+func isRateLimitErrorMessage(msg string) bool {
+	if isMonthlyQuotaErrorMessage(msg) || isOverageErrorMessage(msg) {
+		return false
+	}
+	lower := strings.ToLower(msg)
+	// Explicit hard-quota phrases stay on the longer quota path.
+	if strings.Contains(lower, "quota exhausted") ||
+		(strings.Contains(lower, "quota") && !strings.Contains(lower, "rate limited")) {
+		return false
+	}
+	if strings.Contains(lower, "rate limited") ||
+		strings.Contains(lower, "too many requests") ||
+		strings.Contains(lower, "throttl") {
+		return true
+	}
+	// Bare 429 status token (and our "rate limited (HTTP 429) on …" errors).
+	return hasHTTPStatusToken(msg, "429") || hasHTTPStatusToken(lower, "429")
+}
+
 func isOverageErrorMessage(msg string) bool {
 	msg = strings.ToLower(msg)
 	return (hasHTTPStatusToken(msg, "402") || strings.Contains(msg, "http 402")) &&
@@ -254,9 +276,13 @@ func (h *Handler) handleAccountFailure(account *config.Account, err error) {
 	case isMonthlyQuotaErrorMessage(errMsg):
 		h.markAccountQuotaExhausted(account)
 		h.pool.MarkOverLimit(account.ID)
+	case isRateLimitErrorMessage(errMsg):
+		// Bare 429 / throttling: short cooldown so the number re-enters after
+		// the burst window instead of sitting out a full quota hour.
+		h.pool.RecordRateLimit(account.ID)
+		logger.Infof("[AccountFailover] Rate-limit cooldown %s after 429", account.Email)
 	case isQuotaErrorMessage(errMsg):
-		// 429 / endpoint quota: cool the account so the pool rotates away
-		// instead of immediately re-selecting the same number.
+		// Explicit quota-exhausted wording (non-monthly): medium cooldown.
 		h.pool.RecordError(account.ID, true)
 		logger.Infof("[AccountFailover] Cooldown %s after quota/429", account.Email)
 	case isProfileUnavailableErrorMessage(errMsg):
