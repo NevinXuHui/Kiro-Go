@@ -212,3 +212,32 @@ func TestParseEventStreamReadsStopReasonKeyVariants(t *testing.T) {
 		})
 	}
 }
+
+
+// BuilderId IdC streams often end with contextUsage/metering and omit metadataEvent.
+// That must be treated as a completed turn, not a truncation.
+func TestParseEventStreamSynthesizesStopReasonFromUsageTail(t *testing.T) {
+	var stream bytes.Buffer
+	stream.Write(awsEventStreamFrame(t, "assistantResponseEvent",
+		map[string]interface{}{"content": "pong"}))
+	stream.Write(awsEventStreamFrame(t, "contextUsageEvent",
+		map[string]interface{}{"contextUsagePercentage": 0.01}))
+	stream.Write(awsEventStreamFrame(t, "meteringEvent",
+		map[string]interface{}{"usage": 0.001}))
+
+	var reason string
+	var content string
+	err := parseEventStream(bytes.NewReader(stream.Bytes()), &KiroStreamCallback{
+		OnText:       func(s string, _ bool) { content += s },
+		OnStopReason: func(r string) { reason = r },
+	})
+	if err != nil {
+		t.Fatalf("unexpected parse error: %v", err)
+	}
+	if content != "pong" {
+		t.Fatalf("content=%q", content)
+	}
+	if reason != "END_TURN" {
+		t.Fatalf("stop reason=%q, want END_TURN (synthesized from usage tail)", reason)
+	}
+}

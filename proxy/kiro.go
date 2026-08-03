@@ -145,13 +145,14 @@ func buildKiroTransport(proxyURL string) *http.Transport {
 		MaxConnsPerHost:     0,
 		IdleConnTimeout:     120 * time.Second,
 		DisableCompression:  false,
-		ForceAttemptHTTP2:   true,
+		// AWS Event Stream is more reliable over HTTP/1.1. HTTP/2 has been
+		// observed to end mid-response with a clean EOF, which then surfaces as
+		// "upstream truncated response without stop reason".
+		ForceAttemptHTTP2: false,
 	}
 	if proxyURL != "" {
 		if u, err := url.Parse(proxyURL); err == nil {
 			t.Proxy = http.ProxyURL(u)
-			// Proxied connections cannot negotiate HTTP/2.
-			t.ForceAttemptHTTP2 = false
 		}
 	} else {
 		t.Proxy = http.ProxyFromEnvironment
@@ -444,6 +445,7 @@ func CallKiroAPIContext(ctx context.Context, account *config.Account, payload *K
 	isAPIKey := config.IsAPIKeyAccount(account)
 
 	var lastErr error
+	var quotaExhaustedEndpoints []string
 endpointLoop:
 	for epIndex, ep := range endpoints {
 		// Update the origin field for the selected endpoint.
@@ -512,6 +514,7 @@ endpointLoop:
 			if resp.StatusCode == 429 {
 				resp.Body.Close()
 				logger.Warnf("[KiroAPI] Endpoint %s quota exhausted (429), trying next...", ep.Name)
+				quotaExhaustedEndpoints = append(quotaExhaustedEndpoints, ep.Name)
 				lastErr = withAccountContext(account, fmt.Errorf("quota exhausted on %s", ep.Name))
 				continue endpointLoop
 			}
@@ -566,6 +569,14 @@ endpointLoop:
 	}
 
 	if lastErr != nil {
+		// If every attempted endpoint returned 429, surface a clearer aggregate
+		// error so clients do not think only the last fallback (e.g. AmazonQ) failed.
+		if len(quotaExhaustedEndpoints) > 0 && len(quotaExhaustedEndpoints) >= len(endpoints) {
+			return withAccountContext(account, fmt.Errorf(
+				"quota exhausted on all endpoints (%s)",
+				strings.Join(quotaExhaustedEndpoints, ", "),
+			))
+		}
 		return lastErr
 	}
 	return withAccountContext(account, fmt.Errorf("all endpoints failed"))
@@ -618,6 +629,10 @@ func parseEventStreamTracked(body io.Reader, callback *KiroStreamCallback) (emit
 	var totalCredits float64
 	var contextUsagePercentages []float64
 	var sawOutput bool
+	var sawStopReason bool
+	var sawMetering bool
+	var sawContextUsage bool
+	var eventTypes []string
 	pending := &pendingToolUses{}
 	trackedCallback := *callback
 	originalOnToolUse := trackedCallback.OnToolUse
@@ -684,7 +699,11 @@ func parseEventStreamTracked(body io.Reader, callback *KiroStreamCallback) (emit
 
 		inputTokens, outputTokens = updateTokensFromEvent(event, inputTokens, outputTokens)
 
-		switch headers[":event-type"] {
+		et := headers[":event-type"]
+		if et != "" {
+			eventTypes = append(eventTypes, et)
+		}
+		switch et {
 		case "assistantResponseEvent":
 			if content, ok := event["content"].(string); ok && content != "" {
 				sawOutput = true
@@ -706,19 +725,30 @@ func parseEventStreamTracked(body io.Reader, callback *KiroStreamCallback) (emit
 				return emitted, toolErr
 			}
 		case "meteringEvent":
+			sawMetering = true
 			if usage, ok := event["usage"].(float64); ok {
 				totalCredits += usage
 			}
 		case "contextUsageEvent":
+			sawContextUsage = true
 			if pct, ok := event["contextUsagePercentage"].(float64); ok {
 				contextUsagePercentages = append(contextUsagePercentages, pct)
 			}
-		case "metadataEvent":
+		case "metadataEvent", "messageMetadataEvent":
 			// stopReason rides inside metadataEvent on the wire; there is no
 			// standalone stop reason event type. Its absence after content is
 			// how callers detect a truncated stream.
-			if reason := firstStringField(event, "stopReason", "stop_reason"); reason != "" && callback.OnStopReason != nil {
-				callback.OnStopReason(reason)
+			if reason := extractStopReason(event); reason != "" {
+				sawStopReason = true
+				if callback.OnStopReason != nil {
+					callback.OnStopReason(reason)
+				}
+			} else {
+				logger.Debugf("[KiroAPI] metadataEvent without stopReason: keys=%v", eventKeys(event))
+			}
+		default:
+			if et != "" {
+				logger.Debugf("[KiroAPI] unhandled event-type=%s keys=%v", et, eventKeys(event))
 			}
 		}
 	}
@@ -729,6 +759,20 @@ func parseEventStreamTracked(body io.Reader, callback *KiroStreamCallback) (emit
 	}
 	if !sawOutput {
 		return emitted, errEmptyKiroStream
+	}
+	// Some account paths (notably BuilderId IdC) finish a normal turn with
+	// contextUsageEvent/meteringEvent and never emit metadataEvent/stopReason.
+	// Synthesize END_TURN so stream-integrity does not false-positive those
+	// completed responses as "upstream truncated".
+	if !sawStopReason && (sawMetering || sawContextUsage) {
+		sawStopReason = true
+		if callback.OnStopReason != nil {
+			callback.OnStopReason("END_TURN")
+		}
+		logger.Debugf("[KiroAPI] synthesized END_TURN from usage tail; events=%v", eventTypes)
+	}
+	if sawOutput && !sawStopReason {
+		logger.Warnf("[KiroAPI] stream EOF without stopReason; events=%v", eventTypes)
 	}
 	if callback.OnCredits != nil && totalCredits > 0 {
 		callback.OnCredits(totalCredits)
@@ -1093,6 +1137,36 @@ func firstStringField(m map[string]interface{}, keys ...string) string {
 		}
 	}
 	return ""
+}
+
+// extractStopReason reads stopReason from a metadata event payload. Upstream has
+// used top-level camelCase/snake_case and occasionally nested metadata objects.
+func extractStopReason(event map[string]interface{}) string {
+	if event == nil {
+		return ""
+	}
+	if r := firstStringField(event, "stopReason", "stop_reason", "StopReason"); r != "" {
+		return r
+	}
+	for _, nest := range []string{"metadata", "messageMetadata", "responseMetadata"} {
+		if nested, ok := event[nest].(map[string]interface{}); ok {
+			if r := firstStringField(nested, "stopReason", "stop_reason", "StopReason"); r != "" {
+				return r
+			}
+		}
+	}
+	return ""
+}
+
+func eventKeys(event map[string]interface{}) []string {
+	if event == nil {
+		return nil
+	}
+	keys := make([]string, 0, len(event))
+	for k := range event {
+		keys = append(keys, k)
+	}
+	return keys
 }
 
 func firstBoolField(m map[string]interface{}, keys ...string) bool {
