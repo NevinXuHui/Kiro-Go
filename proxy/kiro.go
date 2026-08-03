@@ -12,6 +12,7 @@ import (
 	"io"
 	"kiro-go/config"
 	"kiro-go/logger"
+	accountpool "kiro-go/pool"
 	"net"
 	"net/http"
 	"net/url"
@@ -515,6 +516,13 @@ endpointLoop:
 				resp.Body.Close()
 				logger.Warnf("[KiroAPI] Endpoint %s quota exhausted (429), trying next...", ep.Name)
 				quotaExhaustedEndpoints = append(quotaExhaustedEndpoints, ep.Name)
+				// Cool immediately on the first 429 so concurrent selectors stop
+				// pile-ons while this request still walks remaining endpoints.
+				// BeginQuotaCooldown does not touch in-flight; handleAccountFailure
+				// still RecordError later to release the select claim.
+				if account != nil && account.ID != "" {
+					accountpool.GetPool().BeginQuotaCooldown(account.ID)
+				}
 				lastErr = withAccountContext(account, fmt.Errorf("quota exhausted on %s", ep.Name))
 				continue endpointLoop
 			}

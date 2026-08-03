@@ -16,6 +16,13 @@ const tokenRefreshSkewSeconds int64 = 120
 // defaultNewAccountFirstUseInterval is used only if config is unavailable.
 const defaultNewAccountFirstUseInterval = time.Minute
 
+// defaultMaxAccountInFlight caps concurrent generation attempts on a single
+// account. Without this, remaining-quota-first selection stamps all traffic
+// onto the one "best" free-tier account until it 429s — then the next best,
+// cascading through a handful of experienced accounts while thousands of
+// virgin imports sit gated by the first-use interval.
+const defaultMaxAccountInFlight = 2
+
 // AccountPool 账号池
 type AccountPool struct {
 	mu            sync.RWMutex
@@ -111,21 +118,27 @@ func (p *AccountPool) isVirginAccount(acc *config.Account) bool {
 
 // claimVirginFirstUseLocked reserves the global first-use slot for acc.
 // Caller must hold p.mu for writing. Returns false if another virgin was
-// claimed too recently.
-func (p *AccountPool) claimVirginFirstUseLocked(acc *config.Account, now time.Time) bool {
+// claimed too recently (unless bypassInterval is set for emergency capacity).
+func (p *AccountPool) claimVirginFirstUseLocked(acc *config.Account, now time.Time, bypassInterval bool) bool {
 	if acc == nil {
 		return false
 	}
 	if !p.isVirginAccount(acc) {
 		return true
 	}
-	if !p.nextNewFirstUseAt.IsZero() && now.Before(p.nextNewFirstUseAt) {
+	if !bypassInterval && !p.nextNewFirstUseAt.IsZero() && now.Before(p.nextNewFirstUseAt) {
 		return false
 	}
 	if p.firstUseStarted == nil {
 		p.firstUseStarted = make(map[string]struct{})
 	}
 	p.firstUseStarted[acc.ID] = struct{}{}
+	if bypassInterval {
+		// Emergency capacity: do not push nextNewFirstUseAt forward so the next
+		// concurrent select can open another virgin. Marking firstUseStarted is
+		// enough to stop this account counting as virgin on the next pass.
+		return true
+	}
 	interval := config.GetNewAccountFirstUseInterval()
 	if interval <= 0 {
 		interval = defaultNewAccountFirstUseInterval
@@ -156,12 +169,27 @@ func (p *AccountPool) inFlightCount(id string) int {
 }
 
 // betterAccount reports whether candidate is preferable to current best under:
-// higher remaining quota → lower in-flight → higher weight → experienced over virgin.
+// under per-account in-flight soft cap → higher remaining quota → lower
+// in-flight → higher weight → experienced over virgin.
+//
+// Soft cap: once an account already has defaultMaxAccountInFlight concurrent
+// attempts, any peer still under the cap wins — even with lower remaining
+// quota. When every candidate is at/over the cap, fall through to normal
+// remaining/in-flight ranking so a single-account pool still serves traffic.
 // Full ties keep the first candidate in RR walk order (return false) so concurrent
 // picks with different start cursors naturally spread instead of sticky-IDing.
 func betterAccount(p *AccountPool, candidate, best *config.Account) bool {
 	if best == nil {
 		return true
+	}
+	if p != nil {
+		ci, bi := p.inFlightCount(candidate.ID), p.inFlightCount(best.ID)
+		cOver := ci >= defaultMaxAccountInFlight
+		bOver := bi >= defaultMaxAccountInFlight
+		if cOver != bOver {
+			// Prefer the account still under the soft cap.
+			return !cOver && bOver
+		}
 	}
 	cr, br := remainingQuota(*candidate), remainingQuota(*best)
 	if cr != br {
@@ -248,7 +276,9 @@ func (p *AccountPool) selectAccountLocked(excluded map[string]bool, model string
 
 	// allowVirgin: include never-used accounts.
 	// virginsOnly: only never-used (used to introduce one new account on interval).
-	pickBest := func(allowVirgin, virginsOnly bool) *config.Account {
+	// bypassInterval: emergency path — open virgins even when the first-use
+	// interval is still closed (experienced accounts all cooling / at cap).
+	pickBest := func(allowVirgin, virginsOnly, bypassInterval bool) *config.Account {
 		var best *config.Account
 		seen := make(map[string]struct{}, 8)
 		for i := 0; i < n; i++ {
@@ -280,8 +310,8 @@ func (p *AccountPool) selectAccountLocked(excluded map[string]bool, model string
 				if !allowVirgin {
 					continue
 				}
-				// Virgin first-use is always interval-gated — never force past it.
-				if !p.nextNewFirstUseAt.IsZero() && now.Before(p.nextNewFirstUseAt) {
+				// Virgin first-use is interval-gated unless emergency bypass.
+				if !bypassInterval && !p.nextNewFirstUseAt.IsZero() && now.Before(p.nextNewFirstUseAt) {
 					continue
 				}
 			} else if virginsOnly {
@@ -295,7 +325,7 @@ func (p *AccountPool) selectAccountLocked(excluded map[string]bool, model string
 		if best == nil {
 			return nil
 		}
-		if p.isVirginAccount(best) && !p.claimVirginFirstUseLocked(best, now) {
+		if p.isVirginAccount(best) && !p.claimVirginFirstUseLocked(best, now, bypassInterval) {
 			// Interval edge race: do not select this virgin this pass.
 			return nil
 		}
@@ -309,18 +339,28 @@ func (p *AccountPool) selectAccountLocked(excluded map[string]bool, model string
 	// Must not compete with equal-remaining experienced accounts or new accounts
 	// would never claim their first-use slot.
 	if intervalOpen {
-		if acc := pickBest(true, true); acc != nil {
+		if acc := pickBest(true, true, false); acc != nil {
 			return acc
 		}
 	}
 	// Pass 2: already-used / previously claimed only.
-	if acc := pickBest(false, false); acc != nil {
+	if acc := pickBest(false, false, false); acc != nil {
 		return acc
 	}
 
+	// Pass 3 (emergency): only when the pool actually has experienced accounts
+	// that are all currently unusable (cooling / expired / exhausted). Opening
+	// virgins past the first-use interval absorbs concurrent load on large
+	// import pools. Pure-virgin pools stay gated by the interval (no force).
+	if p.hasExperiencedAccountLocked() {
+		if acc := pickBest(true, true, true); acc != nil {
+			return acc
+		}
+	}
+
 	// Fallback: accounts whose cooldown has already expired (or never had one) but
-// were missed above — e.g. race with Reload. NEVER re-select an account that is
-// still inside an active cooldown window: a 429 quota cool-down must stick.
+	// were missed above — e.g. race with Reload. NEVER re-select an account that is
+	// still inside an active cooldown window: a 429 quota cool-down must stick.
 	var best *config.Account
 	seen := make(map[string]struct{}, 8)
 	for i := range p.accounts {
@@ -354,6 +394,17 @@ func (p *AccountPool) selectAccountLocked(excluded map[string]bool, model string
 		return accountCopy(best)
 	}
 	return nil
+}
+
+// hasExperiencedAccountLocked reports whether any pool entry is non-virgin.
+// Caller must hold p.mu.
+func (p *AccountPool) hasExperiencedAccountLocked() bool {
+	for i := range p.accounts {
+		if !p.isVirginAccount(&p.accounts[i]) {
+			return true
+		}
+	}
+	return false
 }
 
 // ResetSchedulingState clears first-use gates, cooldowns, in-flight and RR cursor.
@@ -473,6 +524,22 @@ func (p *AccountPool) RecordSuccess(id string) {
 // the selection pool. Short enough to recover from burst limits, long enough
 // to stop thrashing the same free-tier account.
 const quotaCooldownDuration = time.Hour
+
+// BeginQuotaCooldown marks id cooling immediately without releasing in-flight.
+// Used on the first upstream 429 so concurrent selectors stop pile-ons while
+// the same request still finishes endpoint fallback / handleAccountFailure.
+// Idempotent: refreshes the cooldown window each call.
+func (p *AccountPool) BeginQuotaCooldown(id string) {
+	if id == "" {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.cooldowns == nil {
+		p.cooldowns = make(map[string]time.Time)
+	}
+	p.cooldowns[id] = time.Now().Add(quotaCooldownDuration)
+}
 
 // RecordError 记录请求错误，设置冷却
 func (p *AccountPool) RecordError(id string, isQuotaError bool) {

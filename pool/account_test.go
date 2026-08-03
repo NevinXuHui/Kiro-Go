@@ -675,3 +675,107 @@ func TestSelectSkipsActiveQuotaCooldown(t *testing.T) {
 		t.Fatalf("expected nil when every account is cooling, got %s", got.ID)
 	}
 }
+
+// remaining-quota-first must not stampede one account past the soft in-flight cap
+// while another eligible peer is still under the cap.
+func TestSelectRespectsMaxAccountInFlight(t *testing.T) {
+	p := &AccountPool{
+		accounts: []config.Account{
+			{ID: "hot", Email: "hot@x", Enabled: true, Weight: 1, RequestCount: 10, LastUsed: 1, UsageLimit: 50, UsageCurrent: 1},
+			{ID: "cold", Email: "cold@x", Enabled: true, Weight: 1, RequestCount: 10, LastUsed: 1, UsageLimit: 50, UsageCurrent: 40},
+		},
+		cooldowns:   make(map[string]time.Time),
+		errorCounts: make(map[string]int),
+		inFlight:    make(map[string]int),
+		modelLists:  make(map[string]map[string]bool),
+	}
+
+	var gotHot, gotCold int
+	var held []string
+	for i := 0; i < 4; i++ {
+		got := p.GetNext()
+		if got == nil {
+			t.Fatalf("iter %d: expected an account", i)
+		}
+		held = append(held, got.ID)
+		switch got.ID {
+		case "hot":
+			gotHot++
+		case "cold":
+			gotCold++
+		default:
+			t.Fatalf("unexpected id %s", got.ID)
+		}
+	}
+	// First defaultMaxAccountInFlight picks can be hot; further picks must spill
+	// to cold while hot claims are still held.
+	if gotHot > defaultMaxAccountInFlight {
+		t.Fatalf("hot picked %d times with claims held, soft-cap=%d held=%v", gotHot, defaultMaxAccountInFlight, held)
+	}
+	if gotCold < 1 {
+		t.Fatalf("expected cold to receive overflow traffic, held=%v", held)
+	}
+	for _, id := range held {
+		p.ReleaseInFlight(id)
+	}
+}
+
+// When every experienced account is cooling, open virgin imports past the interval
+// so large pools can absorb load instead of returning nil.
+func TestSelectEmergencyVirginWhenExperiencedCooling(t *testing.T) {
+	p := &AccountPool{
+		accounts: []config.Account{
+			{ID: "old", Email: "old@x", Enabled: true, Weight: 1, RequestCount: 5, LastUsed: 1, UsageLimit: 50, UsageCurrent: 1},
+			{ID: "new1", Email: "n1@x", Enabled: true, Weight: 1},
+			{ID: "new2", Email: "n2@x", Enabled: true, Weight: 1},
+		},
+		cooldowns:         make(map[string]time.Time),
+		errorCounts:       make(map[string]int),
+		inFlight:          make(map[string]int),
+		modelLists:        make(map[string]map[string]bool),
+		firstUseStarted:   make(map[string]struct{}),
+		nextNewFirstUseAt: time.Now().Add(time.Hour), // interval closed
+	}
+	p.RecordError("old", true)
+
+	got := p.GetNext()
+	if got == nil {
+		t.Fatal("expected emergency virgin when only experienced account is cooling")
+	}
+	if got.ID != "new1" && got.ID != "new2" {
+		t.Fatalf("got %s, want a virgin", got.ID)
+	}
+	// Cool the just-opened account and release so the next emergency pick must
+	// open a different virgin (bypass does not advance nextNewFirstUseAt).
+	p.RecordError(got.ID, true)
+
+	got2 := p.GetNext()
+	if got2 == nil {
+		t.Fatal("expected second emergency virgin")
+	}
+	if got2.ID == got.ID {
+		t.Fatalf("expected a different virgin, got %s again", got2.ID)
+	}
+	if got2.ID == "old" {
+		t.Fatal("must not reselect cooled experienced account")
+	}
+}
+
+func TestBeginQuotaCooldownDoesNotReleaseInFlight(t *testing.T) {
+	p := &AccountPool{
+		accounts: []config.Account{
+			{ID: "a", Email: "a@x", Enabled: true, Weight: 1, RequestCount: 1, LastUsed: 1},
+		},
+		cooldowns:   make(map[string]time.Time),
+		errorCounts: make(map[string]int),
+		inFlight:    map[string]int{"a": 1},
+		modelLists:  make(map[string]map[string]bool),
+	}
+	p.BeginQuotaCooldown("a")
+	if p.inFlightCount("a") != 1 {
+		t.Fatalf("inFlight=%d, want 1 (BeginQuotaCooldown must not release)", p.inFlightCount("a"))
+	}
+	if p.CooldownUntil("a").IsZero() {
+		t.Fatal("expected cooldown to be set")
+	}
+}

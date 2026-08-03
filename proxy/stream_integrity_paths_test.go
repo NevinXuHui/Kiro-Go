@@ -35,6 +35,7 @@ func setupIntegrityPathTest(t *testing.T, server *httptest.Server) *Handler {
 	t.Cleanup(swapKiroEndpointsForTest(t, server))
 
 	p := accountpool.GetPool()
+	p.ResetSchedulingState()
 	p.Reload()
 	return &Handler{
 		pool:        p,
