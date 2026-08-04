@@ -32,7 +32,10 @@ const (
 	// immediate retry tends to hit the same blip.
 	streamRetryBackoff           = 700 * time.Millisecond
 	maxStreamAttemptsPerEndpoint = 2
-	maxEventStreamMessageSize    = 16 * 1024 * 1024
+	// maxContentLengthShrinkRetries is how many times we re-trim oldest history
+	// and resubmit after upstream CONTENT_LENGTH_EXCEEDS_THRESHOLD / context-full.
+	maxContentLengthShrinkRetries = 2
+	maxEventStreamMessageSize     = 16 * 1024 * 1024
 )
 
 var (
@@ -453,6 +456,7 @@ func CallKiroAPIContext(ctx context.Context, account *config.Account, payload *K
 
 	var lastErr error
 	var quotaExhaustedEndpoints []string
+	contentLengthShrinks := 0
 endpointLoop:
 	for epIndex, ep := range endpoints {
 		// Update the origin field for the selected endpoint.
@@ -537,9 +541,49 @@ endpointLoop:
 			if resp.StatusCode != 200 {
 				errBody, _ := io.ReadAll(resp.Body)
 				resp.Body.Close()
-				lastErr = fmt.Errorf("%s: HTTP %d from %s: %s", accountEmailForLog(account), resp.StatusCode, ep.Name, string(errBody))
+				bodyStr := string(errBody)
+				lastErr = fmt.Errorf("%s: HTTP %d from %s: %s", accountEmailForLog(account), resp.StatusCode, ep.Name, bodyStr)
 				// Authentication errors and payment errors are not retried across endpoints.
 				if resp.StatusCode == 401 || resp.StatusCode == 403 || resp.StatusCode == 402 {
+					return lastErr
+				}
+				// Oversized context is a request-shape problem, not an account or
+				// endpoint problem. Drop oldest history more aggressively and retry
+				// the same endpoint instead of burning the failover chain.
+				if isContentLengthErrorMessage(bodyStr) && contentLengthShrinks < maxContentLengthShrinkRetries {
+					contentLengthShrinks++
+					// Progressively tighter budgets: 70% then 45% of the configured max.
+					// Also never exceed 70%/45% of the current payload size so a body
+					// already under the configured max still shrinks.
+					fracNum, fracDen := 7, 10
+					if contentLengthShrinks >= 2 {
+						fracNum, fracDen = 45, 100
+					}
+					configured := getMaxPayloadBytes()
+					currentSize := payloadByteSize(payload)
+					limit := configured * fracNum / fracDen
+					if alt := currentSize * fracNum / fracDen; alt < limit {
+						limit = alt
+					}
+					if limit < 64*1024 {
+						limit = 64 * 1024
+					}
+					before := len(payload.ConversationState.History)
+					truncatePayloadToLimitBytes(payload, detectHistoryPriming(payload), limit)
+					reqBody, _ = json.Marshal(payload)
+					logger.Warnf("[KiroAPI] Context too long on %s; auto-trimmed history %d→%d entries (budget=%d bytes, shrink %d/%d)",
+						ep.Name, before, len(payload.ConversationState.History), limit, contentLengthShrinks, maxContentLengthShrinkRetries)
+					// Retry the same endpoint with the shrunk body without consuming
+					// a stream-attempt slot (this was a pre-stream 400).
+					streamAttempt--
+					continue
+				}
+				if isContentLengthErrorMessage(bodyStr) {
+					// Surface a stable client-facing message after shrinks are exhausted.
+					lastErr = withAccountContext(account, fmt.Errorf(
+						"Context window is full. Reduce conversation history, system prompt, or tools. (auto-trim exhausted after %d attempts; last upstream: %s)",
+						contentLengthShrinks, bodyStr,
+					))
 					return lastErr
 				}
 				logger.Warnf("[KiroAPI] Endpoint %s error: %v", ep.Name, lastErr)

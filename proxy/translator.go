@@ -51,7 +51,10 @@ const minimalFallbackUserContent = "."
 const toolResultsContinuationPrefix = "Tool results:"
 const toolResultImagePlaceholder = "[Tool returned an image; the image is attached to this message.]"
 
-// maxPayloadBytes is the upper bound for the serialized Kiro request body.
+// defaultMaxPayloadBytes is the fallback upper bound for the serialized Kiro
+// request body when config is unavailable (e.g. unit tests without Init).
+// Production reads the live admin setting via getMaxPayloadBytes().
+//
 // Kiro's upstream rejects oversized requests with HTTP 400
 // "Input is too long." (CONTENT_LENGTH_EXCEEDS_THRESHOLD). When a converted
 // payload exceeds this size we drop the oldest history turns (keeping the
@@ -59,15 +62,29 @@ const toolResultImagePlaceholder = "[Tool returned an image; the image is attach
 // message) and insert a placeholder note so the model knows context was elided.
 // The limit is kept conservatively below the observed upstream threshold to
 // leave room for headers and minor serialization overhead.
-const maxPayloadBytes = 900 * 1024
+const defaultMaxPayloadBytes = 900 * 1024
+
+// maxPayloadBytes is kept as an alias of the default for tests that compare
+// against the historical constant name.
+const maxPayloadBytes = defaultMaxPayloadBytes
 
 // truncationPlaceholder is inserted in history where older turns were dropped to
-// fit within maxPayloadBytes.
+// fit within the configured payload budget.
 const truncationPlaceholder = "[Earlier conversation history was truncated to fit the model's input limit. Older messages and tool activity have been omitted.]"
 
 // minRecentHistoryTurns is the number of most-recent history entries always kept
 // (in addition to system priming and the active tool turn) when truncating.
 const minRecentHistoryTurns = 4
+
+// getMaxPayloadBytes returns the live auto-trim budget in bytes (admin setting
+// maxContextPayloadKB, default 900 KiB). Falls back to defaultMaxPayloadBytes
+// when config is not initialized.
+func getMaxPayloadBytes() int {
+	if n := config.GetMaxContextPayloadBytes(); n > 0 {
+		return n
+	}
+	return defaultMaxPayloadBytes
+}
 
 // stripClaudeDatedSnapshot removes a trailing -YYYYMMDD Anthropic snapshot tag.
 func stripClaudeDatedSnapshot(model string) string {
@@ -1737,7 +1754,8 @@ func sanitizeKiroHistory(history []KiroHistoryMessage, currentToolResultIDs map[
 }
 
 // truncatePayloadToLimit drops the oldest conversation history turns until the
-// serialized payload fits within maxPayloadBytes. It preserves, in order:
+// serialized payload fits within the configured max payload budget. It preserves,
+// in order:
 //   - the system priming pair (if present) at the front of history,
 //   - the most recent turns (at least minRecentHistoryTurns, and always the
 //     active tool turn that pairs with the current message),
@@ -1747,10 +1765,20 @@ func sanitizeKiroHistory(history []KiroHistoryMessage, currentToolResultIDs map[
 // turns were removed so the model is aware context was elided. hasPriming
 // indicates whether history begins with the 2-entry system priming pair.
 func truncatePayloadToLimit(payload *KiroPayload, hasPriming bool) {
+	truncatePayloadToLimitBytes(payload, hasPriming, getMaxPayloadBytes())
+}
+
+// truncatePayloadToLimitBytes is the core trimmer used by the conversion path
+// and by CONTENT_LENGTH retry shrinks. limit is the byte budget for the full
+// serialized payload; values <= 0 fall back to getMaxPayloadBytes().
+func truncatePayloadToLimitBytes(payload *KiroPayload, hasPriming bool, limit int) {
 	if payload == nil {
 		return
 	}
-	if payloadByteSize(payload) <= maxPayloadBytes {
+	if limit <= 0 {
+		limit = getMaxPayloadBytes()
+	}
+	if payloadByteSize(payload) <= limit {
 		return
 	}
 
@@ -1792,7 +1820,7 @@ func truncatePayloadToLimit(payload *KiroPayload, hasPriming bool) {
 	for i := len(conversation) - 1; i >= 0; i-- {
 		running += entrySizes[i]
 		kept := len(conversation) - i
-		if running > maxPayloadBytes && kept > minRecentHistoryTurns {
+		if running > limit && kept > minRecentHistoryTurns {
 			break
 		}
 		keepFrom = i
@@ -1811,8 +1839,8 @@ func truncatePayloadToLimit(payload *KiroPayload, hasPriming bool) {
 
 	// If still too large (current message or retained tail alone exceeds the
 	// limit), shrink the current message content as a last resort.
-	if payloadByteSize(payload) > maxPayloadBytes {
-		truncateCurrentMessage(payload)
+	if payloadByteSize(payload) > limit {
+		truncateCurrentMessageToLimit(payload, limit)
 	}
 }
 
@@ -1850,11 +1878,15 @@ func currentMessageModelID(payload *KiroPayload) string {
 
 // truncateCurrentMessage hard-truncates the current message content as a last
 // resort when even the minimal retained history plus current message exceeds the
-// limit.
+// configured budget.
 func truncateCurrentMessage(payload *KiroPayload) {
+	truncateCurrentMessageToLimit(payload, getMaxPayloadBytes())
+}
+
+func truncateCurrentMessageToLimit(payload *KiroPayload, limit int) {
 	cur := &payload.ConversationState.CurrentMessage.UserInputMessage
 	overhead := payloadByteSize(payload) - len(cur.Content)
-	budget := maxPayloadBytes - overhead
+	budget := limit - overhead
 	if budget < 0 {
 		budget = 0
 	}
@@ -1865,6 +1897,18 @@ func truncateCurrentMessage(payload *KiroPayload) {
 		}
 		cur.Content = cur.Content[:budget]
 	}
+}
+
+// detectHistoryPriming reports whether history still begins with a user+assistant
+// priming pair (used when re-trimming after an upstream CONTENT_LENGTH error).
+func detectHistoryPriming(payload *KiroPayload) bool {
+	if payload == nil {
+		return false
+	}
+	h := payload.ConversationState.History
+	return len(h) >= 2 &&
+		h[0].UserInputMessage != nil &&
+		h[1].AssistantResponseMessage != nil
 }
 
 func buildToolResultsContinuation(toolResults []KiroToolResult) string {

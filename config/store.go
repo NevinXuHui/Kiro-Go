@@ -289,6 +289,7 @@ type settingsBlob struct {
 	ImportConcurrency        int                `json:"importConcurrency,omitempty"`
 	MaxInFlightRequests             int                `json:"maxInFlightRequests,omitempty"`
 	NewAccountFirstUseIntervalSec   int                `json:"newAccountFirstUseIntervalSec,omitempty"`
+	MaxContextPayloadKB             int                `json:"maxContextPayloadKB,omitempty"`
 	ProxyURL                 string             `json:"proxyURL,omitempty"`
 	FilterClaudeCode         bool               `json:"filterClaudeCode,omitempty"`
 	FilterEnvNoise           bool               `json:"filterEnvNoise,omitempty"`
@@ -319,6 +320,7 @@ func settingsFromConfig(c *Config) settingsBlob {
 		ImportConcurrency:        c.ImportConcurrency,
 		MaxInFlightRequests:           c.MaxInFlightRequests,
 		NewAccountFirstUseIntervalSec: c.NewAccountFirstUseIntervalSec,
+		MaxContextPayloadKB:           c.MaxContextPayloadKB,
 		ProxyURL:                 c.ProxyURL,
 		FilterClaudeCode:         c.FilterClaudeCode,
 		FilterEnvNoise:           c.FilterEnvNoise,
@@ -355,6 +357,7 @@ func (s settingsBlob) apply(c *Config) {
 	c.ImportConcurrency = s.ImportConcurrency
 	c.MaxInFlightRequests = s.MaxInFlightRequests
 	c.NewAccountFirstUseIntervalSec = s.NewAccountFirstUseIntervalSec
+	c.MaxContextPayloadKB = s.MaxContextPayloadKB
 	c.ProxyURL = s.ProxyURL
 	c.FilterClaudeCode = s.FilterClaudeCode
 	c.FilterEnvNoise = s.FilterEnvNoise

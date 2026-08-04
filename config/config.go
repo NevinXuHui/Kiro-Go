@@ -234,6 +234,13 @@ type Config struct {
 	// Clamped to 1..3600. Live-read by the account pool (admin changes apply live).
 	NewAccountFirstUseIntervalSec int `json:"newAccountFirstUseIntervalSec,omitempty"`
 
+	// MaxContextPayloadKB is the max serialized Kiro request body size in KiB used
+	// when auto-trimming the oldest conversation history. Defaults to 900.
+	// Clamped to 64..2048. Live-read by the translator so admin changes apply live.
+	// Upstream rejects oversized bodies with CONTENT_LENGTH_EXCEEDS_THRESHOLD;
+	// a lower value trims earlier and leaves more headroom for tools/system prompt.
+	MaxContextPayloadKB int `json:"maxContextPayloadKB,omitempty"`
+
 	// Proxy configuration: optional outbound proxy for Kiro API requests
 	// Format: "socks5://host:port", "socks5://user:pass@host:port",
 	//         "http://host:port",  "http://user:pass@host:port"
@@ -1853,6 +1860,53 @@ func UpdateNewAccountFirstUseIntervalSec(n int) error {
 		return errors.New("config not initialized")
 	}
 	cfg.NewAccountFirstUseIntervalSec = n
+	return saveSettingsLocked()
+}
+
+const (
+	defaultMaxContextPayloadKB = 900
+	minMaxContextPayloadKB     = 64
+	maxMaxContextPayloadKB     = 2048
+)
+
+// GetMaxContextPayloadKB returns the auto-trim payload budget in KiB.
+// Default 900; clamped to 64..2048. Live-read (no restart needed).
+func GetMaxContextPayloadKB() int {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	n := defaultMaxContextPayloadKB
+	if cfg != nil && cfg.MaxContextPayloadKB > 0 {
+		n = cfg.MaxContextPayloadKB
+	}
+	if n < minMaxContextPayloadKB {
+		n = minMaxContextPayloadKB
+	}
+	if n > maxMaxContextPayloadKB {
+		n = maxMaxContextPayloadKB
+	}
+	return n
+}
+
+// GetMaxContextPayloadBytes returns the auto-trim payload budget in bytes.
+func GetMaxContextPayloadBytes() int {
+	return GetMaxContextPayloadKB() * 1024
+}
+
+// UpdateMaxContextPayloadKB sets the auto-trim payload budget in KiB and persists.
+// Clamped to 64..2048.
+func UpdateMaxContextPayloadKB(n int) error {
+	if n < minMaxContextPayloadKB {
+		n = minMaxContextPayloadKB
+	}
+	if n > maxMaxContextPayloadKB {
+		n = maxMaxContextPayloadKB
+	}
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	if cfg == nil {
+		return errors.New("config not initialized")
+	}
+	cfg.MaxContextPayloadKB = n
 	return saveSettingsLocked()
 }
 

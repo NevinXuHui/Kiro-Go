@@ -176,6 +176,20 @@ func isProfileUnavailableErrorMessage(msg string) bool {
 	return strings.Contains(msg, "no available kiro profile")
 }
 
+// isContentLengthErrorMessage detects oversized-input rejections from Kiro /
+// Amazon Q / clients. These are request-shape failures: auto-trim oldest
+// history and retry; do not cool or disable the account.
+func isContentLengthErrorMessage(msg string) bool {
+	lower := strings.ToLower(msg)
+	return strings.Contains(lower, "content_length_exceeds_threshold") ||
+		strings.Contains(lower, "input is too long") ||
+		strings.Contains(lower, "context window is full") ||
+		strings.Contains(lower, "context_length_exceeded") ||
+		strings.Contains(lower, "maximum context length") ||
+		strings.Contains(lower, "prompt is too long") ||
+		strings.Contains(lower, "reduce conversation history")
+}
+
 func isAuthErrorMessage(msg string) bool {
 	// Suspension is more specific than bare 403; callers should check it first.
 	if isSuspensionErrorMessage(msg) {
@@ -290,6 +304,10 @@ func (h *Handler) handleAccountFailure(account *config.Account, err error) {
 		// Treat as a soft failure: short cooldown so the next request rotates account,
 		// but never auto-disable — operators can still investigate via warn logs.
 		h.pool.RecordError(account.ID, false)
+	case isContentLengthErrorMessage(errMsg):
+		// Oversized conversation is not an account health signal. The request
+		// path already auto-trims; do not cool the account or burn failover budget.
+		logger.Infof("[AccountFailover] Ignoring content-length failure for %s (request too large)", account.Email)
 	case isAuthErrorMessage(errMsg):
 		h.disableAccount(account, "BANNED", "Authentication failed - token invalid or expired")
 	default:

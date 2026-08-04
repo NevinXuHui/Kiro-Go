@@ -37,8 +37,9 @@ func TestClaudeToKiroTruncatesOversizedHistory(t *testing.T) {
 	if err != nil {
 		t.Fatalf("marshal failed: %v", err)
 	}
-	if len(raw) > maxPayloadBytes {
-		t.Fatalf("payload size %d exceeds limit %d after truncation", len(raw), maxPayloadBytes)
+	limit := getMaxPayloadBytes()
+	if len(raw) > limit {
+		t.Fatalf("payload size %d exceeds limit %d after truncation", len(raw), limit)
 	}
 
 	// The current message must be preserved.
@@ -85,6 +86,75 @@ func TestClaudeToKiroSmallPayloadNotTruncated(t *testing.T) {
 	for _, h := range payload.ConversationState.History {
 		if h.UserInputMessage != nil && strings.Contains(h.UserInputMessage.Content, "truncated to fit") {
 			t.Fatalf("small payload should not be truncated")
+		}
+	}
+}
+
+// TestTruncatePayloadToLimitBytesHonorsCustomBudget verifies that a tighter
+// admin-configured budget drops more oldest history while keeping the current
+// message and a truncation placeholder.
+func TestTruncatePayloadToLimitBytesHonorsCustomBudget(t *testing.T) {
+	big := strings.Repeat("lorem ipsum dolor sit amet ", 40) // ~1KB
+	msgs := []ClaudeMessage{
+		{Role: "user", Content: "start"},
+	}
+	for i := 0; i < 200; i++ {
+		msgs = append(msgs,
+			ClaudeMessage{Role: "assistant", Content: "step: " + big},
+			ClaudeMessage{Role: "user", Content: "next: " + big},
+		)
+	}
+	msgs = append(msgs, ClaudeMessage{Role: "user", Content: "FINAL current turn"})
+
+	req := &ClaudeRequest{
+		Model:    "claude-opus-4.8",
+		System:   "You are a helpful assistant.",
+		Messages: msgs,
+	}
+	payload := ClaudeToKiro(req, false)
+
+	// Force a much tighter budget than the default.
+	const tight = 80 * 1024
+	before := payloadByteSize(payload)
+	if before <= tight {
+		t.Fatalf("precondition failed: payload %d already under tight budget %d", before, tight)
+	}
+	truncatePayloadToLimitBytes(payload, true, tight)
+	after := payloadByteSize(payload)
+	if after > tight {
+		t.Fatalf("after custom trim size %d exceeds budget %d", after, tight)
+	}
+	cur := payload.ConversationState.CurrentMessage.UserInputMessage.Content
+	if !strings.Contains(cur, "FINAL current turn") {
+		t.Fatalf("current message lost after custom-budget trim: %q", cur[:min(80, len(cur))])
+	}
+	found := false
+	for _, h := range payload.ConversationState.History {
+		if h.UserInputMessage != nil && strings.Contains(h.UserInputMessage.Content, "truncated to fit") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("expected truncation placeholder after custom-budget trim")
+	}
+}
+
+func TestIsContentLengthErrorMessage(t *testing.T) {
+	cases := []struct {
+		msg  string
+		want bool
+	}{
+		{`{"message":"Input is too long.","reason":"CONTENT_LENGTH_EXCEEDS_THRESHOLD"}`, true},
+		{"Context window is full. Reduce conversation history, system prompt, or tools.", true},
+		{"context_length_exceeded", true},
+		{"This model's maximum context length is 200000 tokens", true},
+		{"rate limited (HTTP 429)", false},
+		{"HTTP 401 unauthorized", false},
+	}
+	for _, c := range cases {
+		if got := isContentLengthErrorMessage(c.msg); got != c.want {
+			t.Errorf("isContentLengthErrorMessage(%q) = %v, want %v", c.msg, got, c.want)
 		}
 	}
 }

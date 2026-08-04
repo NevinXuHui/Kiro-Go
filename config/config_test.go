@@ -264,6 +264,36 @@ func TestGetMaxInFlightRequestsDefaultAndClamp(t *testing.T) {
 	}
 }
 
+func TestGetMaxContextPayloadKBDefaultAndClamp(t *testing.T) {
+	if err := Init(filepath.Join(t.TempDir(), "config.json")); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	if got := GetMaxContextPayloadKB(); got != 900 {
+		t.Fatalf("default MaxContextPayloadKB = %d, want 900", got)
+	}
+	if got := GetMaxContextPayloadBytes(); got != 900*1024 {
+		t.Fatalf("default bytes = %d, want %d", got, 900*1024)
+	}
+	if err := UpdateMaxContextPayloadKB(512); err != nil {
+		t.Fatalf("update 512: %v", err)
+	}
+	if got := GetMaxContextPayloadKB(); got != 512 {
+		t.Fatalf("got %d, want 512", got)
+	}
+	if err := UpdateMaxContextPayloadKB(10); err != nil {
+		t.Fatalf("update 10: %v", err)
+	}
+	if got := GetMaxContextPayloadKB(); got != 64 {
+		t.Fatalf("clamp low got %d, want 64", got)
+	}
+	if err := UpdateMaxContextPayloadKB(99999); err != nil {
+		t.Fatalf("update 99999: %v", err)
+	}
+	if got := GetMaxContextPayloadKB(); got != 2048 {
+		t.Fatalf("clamp high got %d, want 2048", got)
+	}
+}
+
 func TestUpdateRuntimeStatsSnapshotPreservesNonStatsFields(t *testing.T) {
 	cfgFile := filepath.Join(t.TempDir(), "config.json")
 	if err := Init(cfgFile); err != nil {

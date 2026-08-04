@@ -2386,6 +2386,13 @@
         Number.isFinite(firstUseSec) && firstUseSec > 0 ? Math.min(3600, Math.max(1, firstUseSec)) : 60
       );
     }
+    const maxCtxKB = parseInt(d.maxContextPayloadKB, 10);
+    const maxCtxInput = $('maxContextPayloadKB');
+    if (maxCtxInput) {
+      maxCtxInput.value = String(
+        Number.isFinite(maxCtxKB) && maxCtxKB > 0 ? Math.min(2048, Math.max(64, maxCtxKB)) : 900
+      );
+    }
     await Promise.all([loadThinkingConfig(), loadEndpointConfig(), loadProxyConfig(), loadPromptFilter(), loadApiKeys()]);
     refreshCustomSelects();
   }
@@ -2512,6 +2519,11 @@
       toast(t('settings.newAccountFirstUseIntervalInvalid'), 'warning');
       return;
     }
+    const rawMaxCtxKB = parseInt(($('maxContextPayloadKB') && $('maxContextPayloadKB').value) || '900', 10);
+    if (!Number.isFinite(rawMaxCtxKB) || rawMaxCtxKB < 64 || rawMaxCtxKB > 2048) {
+      toast(t('settings.maxContextPayloadKBInvalid'), 'warning');
+      return;
+    }
     await api('/settings', {
       method: 'POST',
       body: JSON.stringify({
@@ -2520,7 +2532,8 @@
         batchTestConcurrency: rawConc,
         importConcurrency: rawImportConc,
         maxInFlightRequests: rawMaxInFlight,
-        newAccountFirstUseIntervalSec: rawFirstUseSec
+        newAccountFirstUseIntervalSec: rawFirstUseSec,
+        maxContextPayloadKB: rawMaxCtxKB
       })
     });
     showExhaustedAccounts = showExhaustedAccountsValue;

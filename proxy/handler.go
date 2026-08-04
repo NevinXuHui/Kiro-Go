@@ -4948,6 +4948,7 @@ func (h *Handler) apiGetSettings(w http.ResponseWriter, r *http.Request) {
 		"importConcurrency":             config.GetImportConcurrency(),
 		"maxInFlightRequests":           config.GetMaxInFlightRequests(),
 		"newAccountFirstUseIntervalSec": int(config.GetNewAccountFirstUseInterval().Seconds()),
+		"maxContextPayloadKB":           config.GetMaxContextPayloadKB(),
 	})
 }
 
@@ -5005,6 +5006,7 @@ func (h *Handler) apiUpdateSettings(w http.ResponseWriter, r *http.Request) {
 		ImportConcurrency             *int    `json:"importConcurrency,omitempty"`
 		MaxInFlightRequests           *int    `json:"maxInFlightRequests,omitempty"`
 		NewAccountFirstUseIntervalSec *int    `json:"newAccountFirstUseIntervalSec,omitempty"`
+		MaxContextPayloadKB           *int    `json:"maxContextPayloadKB,omitempty"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		w.WriteHeader(400)
@@ -5068,6 +5070,15 @@ func (h *Handler) apiUpdateSettings(w http.ResponseWriter, r *http.Request) {
 	// 新账号首次使用间隔（秒）
 	if req.NewAccountFirstUseIntervalSec != nil {
 		if err := config.UpdateNewAccountFirstUseIntervalSec(*req.NewAccountFirstUseIntervalSec); err != nil {
+			w.WriteHeader(500)
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+	}
+
+	// 上下文自动裁剪大小（KiB）
+	if req.MaxContextPayloadKB != nil {
+		if err := config.UpdateMaxContextPayloadKB(*req.MaxContextPayloadKB); err != nil {
 			w.WriteHeader(500)
 			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 			return
