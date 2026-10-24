@@ -12,7 +12,7 @@ import (
 	"sync"
 	"time"
 
-	_ "modernc.org/sqlite"
+	_ "github.com/glebarez/go-sqlite"
 )
 
 // db is the SQLite handle. Nil means "JSON-only mode" (tests that never open a DB
