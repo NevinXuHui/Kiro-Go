@@ -512,7 +512,7 @@ endpointLoop:
 			req.Header.Set("Amz-Sdk-Request", fmt.Sprintf("attempt=%d; max=%d", streamAttempt, maxStreamAttemptsPerEndpoint))
 			req.Header.Set("Amz-Sdk-Invocation-Id", invocationID)
 
-			resp, err := GetClientForProxy(ResolveAccountProxyURL(account)).Do(req)
+			resp, err := streamingHTTPClient(ctx, ResolveAccountProxyURL(account)).Do(req)
 			if err != nil {
 				lastErr = err
 				logger.Warnf("[KiroAPI] Endpoint %s failed: %v", ep.Name, err)
